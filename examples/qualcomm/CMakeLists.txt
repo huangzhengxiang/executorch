@@ -65,6 +65,9 @@ set(_common_include_directories
     ${EXECUTORCH_ROOT}/extension/llm/tokenizers/third-party/json/single_include
 )
 
+# build MobileLMStore
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/MobileLMStore)
+
 # build qnn_executor_runner
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/executor_runner)
 

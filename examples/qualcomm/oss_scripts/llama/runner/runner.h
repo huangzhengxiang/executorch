@@ -27,6 +27,8 @@
 #include <executorch/extension/llm/runner/stats.h>
 #include <executorch/extension/module/module.h>
 #include <pytorch/tokenizers/tokenizer.h>
+#include <NaiveKVStore.h>
+#include <SQLiteKVStore.h>
 
 namespace example {
 
@@ -67,6 +69,8 @@ class Runner : public executorch::extension::llm::IRunner {
       const int ngram = 0,
       const int window = 0,
       const int gcap = 0,
+      const bool use_kv_store = false,
+      const int test_level = 0,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
           attention_sink_rope_module = nullptr);
@@ -96,6 +100,7 @@ class Runner : public executorch::extension::llm::IRunner {
     kKVCached = 0,
     kHybrid,
     kLookaheadDecoding,
+    // kBlend,
     kUnsupported,
   };
 
@@ -106,6 +111,8 @@ class Runner : public executorch::extension::llm::IRunner {
   int ngram_{0};
   int window_{0};
   int gcap_{0};
+  int use_kv_store_{false};
+  int test_level_{0};
 
   // Defaults to StaticCahce, indicating that the model does not use a
   // global/local architecture.
@@ -122,6 +129,8 @@ class Runner : public executorch::extension::llm::IRunner {
   DecoderModelVersion decoder_model_version_;
   std::unique_ptr<IMemAlloc> buffer_manager_;
   std::unique_ptr<KVManager<T>> kv_manager_;
+  // std::unique_ptr<LMStore::NaiveKVStore<T>> kv_store_;
+  std::unique_ptr<LMStore::SQLiteKVStore<T>> kv_store_;
   std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
   std::unique_ptr<DecoderRunner> decoder_runner_;
   std::unique_ptr<AttentionSinkRopeRunner> attention_sink_rope_runner_;

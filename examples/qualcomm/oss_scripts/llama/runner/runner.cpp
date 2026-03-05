@@ -22,8 +22,12 @@
 #include <executorch/runtime/platform/log.h>
 #include <pytorch/tokenizers/hf_tokenizer.h>
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
+#include <NaiveKVStore.h>
+#include <SQLiteKVStore.h>
 #include <algorithm>
 #include <fstream>
+#include <iostream>
+
 
 using executorch::extension::Module;
 using executorch::extension::llm::get_rss_bytes;
@@ -98,12 +102,16 @@ Runner<T>::Runner(
     const int ngram,
     const int window,
     const int gcap,
+    const bool use_kv_store,
+    const int test_level,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
     : module_(std::move(module)),
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
+      use_kv_store_(use_kv_store),
+      test_level_(test_level),
       tokenizer_path_(tokenizer_path),
       performance_output_path_(performance_output_path),
       dump_logits_path_(dump_logits_path),
@@ -442,13 +450,57 @@ Error Runner<T>::generate_from_prompt_or_file(
     token_callback(prompt);
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
+
+  // test store and load effect.
+  int num_layers = kv_manager_->get_num_layers();
+  int num_heads = kv_manager_->get_num_heads();
+  int head_dim = kv_manager_->get_head_dim();
+  kv_store_ = std::make_unique<LMStore::SQLiteKVStore<T>>("qwen3-1.7b-000.bin",
+      num_layers, num_heads, head_dim, prompt_tokens.size());
+  std::vector<T*> k_store(num_layers, nullptr), v_store(num_layers, nullptr);
+  for (int j = 0; j < num_layers; ++j) {
+    k_store[j] = (T*)malloc(num_heads * head_dim * prompt_tokens.size() * sizeof(T));
+    v_store[j] = (T*)malloc(num_heads * prompt_tokens.size() * head_dim  * sizeof(T));
+  }
+  bool matched = false;
+  if (use_kv_store_) {
+    // check if file exists
+    matched = kv_store_->whole_matching(prompt_tokens);
+    // if exists, load kv
+    if (matched) {
+      kv_store_->transfer_cache(k_store, v_store, false);
+      kv_manager_->transfer_cache(k_store, v_store, prompt_tokens.size(),
+          prompt_tokens.size(), prompt_tokens.size(), false);
+    }
+  } 
+  // prefill inference
+  uint64_t cur_token;
+  if (use_kv_store_ && matched) {
+    kv_store_->read_next_token(&cur_token);
+  } else {
   auto prefill_res = prompt_processor_->prefill(
       prompt_tokens, cur_pos_, dump_logits, attention_sink_rope_runner_.get());
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
-  uint64_t cur_token = prefill_res.get();
+  cur_token = prefill_res.get();
+  }
   cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
+  // store kv
+  if (use_kv_store_ && !matched) {
+    ET_LOG(
+      Info,
+      "Storing KV caches to disk...\n");
+    kv_store_->write_prompt_tokens(prompt_tokens);
+    kv_store_->write_next_token(cur_token);
+    kv_manager_->transfer_cache(k_store, v_store, prompt_tokens.size(),
+        prompt_tokens.size(), prompt_tokens.size(), true);
+    kv_store_->transfer_cache(k_store, v_store, true);
+  }
+  for (int j = 0; j < num_layers; ++j) {
+    free(k_store[j]);
+    free(v_store[j]);
+  }
 
   // print the first token from prefill. No prev_token so use cur_token for
   // it.

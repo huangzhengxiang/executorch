@@ -284,6 +284,61 @@ void KVManager<T>::update_cache(
 }
 
 template <typename T>
+void KVManager<T>::transfer_cache(
+    std::vector<T*>& k_buffer,
+    std::vector<T*>& v_buffer,
+    int buffer_seq_dim,
+    int copy_len,
+    int32_t n_past,
+    bool directionM2D, // true: M2D, false: D2M
+    int disk_start_id,
+    int mem_start_id) {
+  int32_t disk_cache_num = buffer_seq_dim;
+  int32_t mem_cache_num = (cur_ar_len_ == metadata_.context_len)
+          ? metadata_.context_len
+          : metadata_.context_len - cur_ar_len_;
+  int32_t src_cache_num;
+  int32_t dst_cache_num;
+  // mem_start_id += mem_cache_num - n_past; // reverse?
+  T *k_cache_in_read_ptr, *k_cache_in_write_ptr, *v_cache_in_read_ptr, *v_cache_in_write_ptr;
+  for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    if (directionM2D) {
+      // M2D, from cache to buffer
+      src_cache_num = mem_cache_num;
+      dst_cache_num = disk_cache_num;
+      k_cache_in_read_ptr = k_cache_[layer].buffer + mem_start_id;
+      k_cache_in_write_ptr = k_buffer[layer] + disk_start_id;
+      v_cache_in_read_ptr = v_cache_[layer].buffer + mem_start_id * metadata_.head_dim;
+      v_cache_in_write_ptr = v_buffer[layer] + disk_start_id * metadata_.head_dim;
+    } else {
+      // D2M, from buffer to cache
+      src_cache_num = disk_cache_num;
+      dst_cache_num = mem_cache_num;
+      k_cache_in_read_ptr = k_buffer[layer] + disk_start_id;
+      k_cache_in_write_ptr = k_cache_[layer].buffer + mem_start_id;
+      v_cache_in_read_ptr = v_buffer[layer] + disk_start_id * metadata_.head_dim;
+      v_cache_in_write_ptr = v_cache_[layer].buffer + mem_start_id * metadata_.head_dim;
+    }
+    // copy k
+    for (int i = 0; i < metadata_.head_dim * metadata_.num_heads; i++) {
+      std::memcpy(
+          k_cache_in_write_ptr, k_cache_in_read_ptr, copy_len * sizeof(T));
+      k_cache_in_read_ptr += src_cache_num;
+      k_cache_in_write_ptr += dst_cache_num;
+    }
+    // copy v
+    for (int i = 0; i < metadata_.num_heads; i++) {
+      std::memcpy(
+          v_cache_in_write_ptr,
+          v_cache_in_read_ptr,
+          copy_len * metadata_.head_dim * sizeof(T));
+      v_cache_in_read_ptr += src_cache_num * metadata_.head_dim;
+      v_cache_in_write_ptr += dst_cache_num * metadata_.head_dim;
+    }
+  }
+}
+
+template <typename T>
 void KVManager<T>::update_key(
     KVCache<T>& k_cache,
     int32_t n_past,

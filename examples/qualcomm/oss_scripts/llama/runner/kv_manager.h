@@ -152,6 +152,16 @@ class KVManager {
       int32_t n_update,
       const std::vector<bool>& selected);
 
+  void transfer_cache(
+      std::vector<T*>& k_buffer,
+      std::vector<T*>& v_buffer,
+      int buffer_seq_dim,
+      int copy_len,
+      int32_t n_past,
+      bool directionM2D, // true: M2D, false: D2M
+      int disk_start_id=0,
+      int mem_start_id=0);
+
   const std::vector<KVCache<T>>& get_k_cache_() const {
     return k_cache_;
   }
@@ -165,6 +175,12 @@ class KVManager {
 
   int64_t get_head_dim() const {
     return metadata_.head_dim;
+  }
+  int64_t get_num_heads() const {
+    return metadata_.num_heads;
+  }
+  int64_t get_num_layers() const {
+    return metadata_.num_layers;
   }
 
  private:

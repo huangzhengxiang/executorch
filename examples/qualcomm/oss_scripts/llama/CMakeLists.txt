@@ -55,12 +55,15 @@ list(APPEND _llama_runner__srcs)
 add_executable(qnn_llama_runner ${_llama_runner__srcs})
 target_include_directories(
   qnn_llama_runner PUBLIC ${_common_include_directories}
+                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/include/
+                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/
 )
 
 executorch_target_link_options_shared_lib(quantized_ops_lib)
 
 target_link_libraries(
   qnn_llama_runner
+  LMStore
   qnn_executorch_backend
   executorch_core
   extension_data_loader
