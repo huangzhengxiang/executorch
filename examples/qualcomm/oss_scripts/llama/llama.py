@@ -30,6 +30,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     ATTENTION_SINK_EVICTOR,
     AUDIO_ENCODER,
     DECODE_QDQ_FILENAME,
+    BLENDER_DECODER_GRAPH_NAMES,
     DECODER_GRAPH_NAMES,
     EVAL_MODE,
     PROMPT_EVAL,
@@ -150,6 +151,11 @@ def compile(
         # x86 emulator does not support weight sharing
         use_weight_sharing=not args.enable_x86_64,
     )
+
+    if args.model_mode == "blender":
+        graph_num = len(BLENDER_DECODER_GRAPH_NAMES)
+    else:
+        graph_num = len(DECODER_GRAPH_NAMES)
     compile_specs[TEXT_DECODER] = [
         generate_qnn_executorch_compiler_spec(
             soc_model=get_soc_to_chipset_map()[args.model],
@@ -157,7 +163,7 @@ def compile(
             shared_buffer=not args.enable_x86_64,
             use_mha2sha=True,
         )
-    ] * len(DECODER_GRAPH_NAMES)
+    ] * graph_num
 
     # perform compilation
     multi_modal_mgr.compile(compile_specs=compile_specs, pte_filenames=pte_filenames)
@@ -463,6 +469,13 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--blend_len",
+        help="Represents the fixed KV recompute length of Mobile Cache Blend.",
+        default=32,
+        type=int,
+    )
+
+    parser.add_argument(
         "--image_path",
         help="Path to the image file for multimodal language models (MLLM). If not specified, the default image from encoder/encoder_config.py will be used. The image should be preprocessed and saved in raw binary format.",
         default=None,
@@ -514,6 +527,7 @@ def export_llama(args) -> None:
     if (TASKS_EVAL or SQNR_EVAL) in args.eval_methods and args.model_mode not in {
         "kv",
         "hybrid",
+        "blender"
     }:
         raise RuntimeError(
             "Eval device perplexity is only supported for KV mode. Hybrid mode will only use KV mode when evaluating tasks/sqnr."
@@ -541,6 +555,14 @@ def export_llama(args) -> None:
             args.max_context_len >= args.prefill_ar_len
         ), "Please ensure max_context_len is >= prefill_ar_len"
         pte_filename = "hybrid_llama_qnn"
+    elif args.model_mode == "blender":
+        assert (
+            args.max_context_len >= args.prefill_ar_len
+        ), "Please ensure max_context_len is >= prefill_ar_len"
+        assert (
+            args.blend_len <= args.prefill_ar_len
+        ), "Please ensure blend_len is <= prefill_ar_len"
+        pte_filename = "blender_llama_qnn"
     elif args.model_mode == "lookahead":
         assert (
             args.max_context_len >= args.prefill_ar_len

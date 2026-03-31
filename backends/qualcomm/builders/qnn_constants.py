@@ -530,6 +530,10 @@ class OpRmsNorm:
     param_epsilon: str = "epsilon"
     param_axes: str = "axes"
 
+@dataclass(init=False, frozen=True)
+class OpScatterElements:
+    op_name: str = "ScatterElements"
+    param_axis: str = "axis"
 
 @dataclass(init=False, frozen=True)
 class OpScatterNd:

@@ -268,9 +268,10 @@ class AttentionSinkRope(nn.Module):
 
 
 class LlamaAttention(nn.Module):
-    def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
+    def __init__(self, layer_idx: int, ar_len, config: ModelArgs, output_new_cache_only=False):
         super().__init__()
         self.config = config
+        self.ar_len = ar_len
         self.dim = config.dim
         self.n_heads = config.n_heads
         self.head_dim = config.head_dim
@@ -284,10 +285,13 @@ class LlamaAttention(nn.Module):
         self.use_qk_norm = config.use_qk_norm
         self.qk_norm_before_rope = config.qk_norm_before_rope
         # If None, assume each layer uses rope
+        self.layer_idx = layer_idx
         self.use_rope = (
             config.no_rope_layer_interval is None
-            or (layer_idx + 1) % config.no_rope_layer_interval
+            or (self.layer_idx + 1) % config.no_rope_layer_interval
         )
+        self.use_blend = config.use_blend
+        self.blend_len = config.blend_len
 
         if self.use_qk_norm:
             q_norm_dim = self.head_dim
@@ -340,6 +344,16 @@ class LlamaAttention(nn.Module):
                 persistent=False,
             )
 
+        if self.use_blend:
+            self.register_buffer(
+                "last_token_idx",
+                (torch.arange(self.blend_len) 
+                    == torch.ones(self.blend_len, dtype=torch.int32)*(self.blend_len-1)),
+                persistent=False,
+            )
+
+        
+
     def prepare_attention_conv(self):
         self.wq_conv = nn.Conv2d(
             self.dim,
@@ -388,6 +402,8 @@ class LlamaAttention(nn.Module):
         atten_mask: torch.Tensor,
         k_caches: List[torch.Tensor],
         v_caches: List[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+        imp_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len, _ = hidden_states.shape
         hidden_states = torch.reshape(
@@ -412,17 +428,28 @@ class LlamaAttention(nn.Module):
             q = self.apply_rope_emb(q, freqs_cos, freqs_sin)
             k = self.apply_rope_emb(k, freqs_cos, freqs_sin)
 
+        # TODO: post norm + blend not supported yet!!!
         if self.use_qk_norm and not self.qk_norm_before_rope:
             q = self.q_norm_fn(q)
             k = self.k_norm_fn(k)
         if getattr(self.config, "enable_r3", False):
             q = torch.matmul(q, self.r3_weight)
             k = torch.matmul(k, self.r3_weight)
+        
+        if self.use_blend:
+            blend_results = self.blend(q, k, v, atten_mask, valid_mask,
+                                       k_caches, v_caches, imp_indices)
+            q, k, v, atten_mask, k_caches, v_caches, imp_indices = blend_results
+            seq_len = self.blend_len
+
         k = k.transpose(2, 3)
 
         kh, vh = None, None
         # kv cache mode
-        if self.use_kv_cache:
+        if self.use_blend:
+            kh = k_caches
+            vh = v_caches
+        elif self.use_kv_cache:
             kh = torch.cat([k_caches, k], dim=-1)
             vh = torch.cat([v_caches, v], dim=2)
         # batch_prefill mode
@@ -450,9 +477,9 @@ class LlamaAttention(nn.Module):
         y = y.reshape(bsz, seq_len, -1)
 
         if self.output_new_cache_only:
-            return y, [k], [v]
+            return y, [k], [v], imp_indices
 
-        return y, [kh], [vh]
+        return y, [kh], [vh], imp_indices
 
     def forward(
         self,
@@ -462,6 +489,8 @@ class LlamaAttention(nn.Module):
         atten_mask: torch.Tensor,
         k_caches: List[torch.Tensor],
         v_caches: List[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+        imp_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len, _ = hidden_states.shape
 
@@ -480,17 +509,28 @@ class LlamaAttention(nn.Module):
             q = self.apply_rope_emb(q, freqs_cos, freqs_sin)
             k = self.apply_rope_emb(k, freqs_cos, freqs_sin)
 
+        # TODO: post norm + blend not supported yet!!!
         if self.use_qk_norm and not self.qk_norm_before_rope:
             q = self.q_norm_fn(q)
             k = self.k_norm_fn(k)
         if getattr(self.config, "enable_r3", False):
             q = torch.matmul(q, self.r3_weight)
             k = torch.matmul(k, self.r3_weight)
+
+        if self.use_blend:
+            blend_results = self.blend(q, k, v, atten_mask, valid_mask, 
+                                       k_caches, v_caches, imp_indices)
+            q, k, v, atten_mask, k_caches, v_caches, imp_indices = blend_results
+            seq_len = self.blend_len
+
         k = k.transpose(2, 3)
 
         kh, vh = None, None
         # kv cache mode
-        if self.use_kv_cache:
+        if self.use_blend:
+            kh = k_caches
+            vh = v_caches
+        elif self.use_kv_cache:
             kh = torch.cat([k_caches, k], dim=-1)
             vh = torch.cat([v_caches, v], dim=2)
         # batch_prefill mode
@@ -520,9 +560,58 @@ class LlamaAttention(nn.Module):
         y = self.wo(y)
 
         if self.output_new_cache_only:
-            return y, [k], [v]
+            return y, [k], [v], imp_indices
 
-        return y, [kh], [vh]
+        return y, [kh], [vh], imp_indices
+
+    def blend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        atten_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+        k_caches: List[torch.Tensor],
+        v_caches: List[torch.Tensor],
+        imp_indices: torch.Tensor
+    ):
+        if self.use_blend and self.layer_idx==0:
+        # if self.use_blend and self.layer_idx in self.blend_check_layers:
+            # q, k, v: [B, H, S, D]
+            # k_caches: [B, H, D, S], v_caches: [B, H, S, D]
+            # atten_mask: [B, 1, S, CL]
+            # valid_mask: [B, S]
+            diff_k = torch.sum(
+                (k.transpose(2, 3) - k_caches[:, :, :, -self.ar_len:]) ** 2, dim=[1, 2],
+                keepdim=False
+            )
+            diff_k = torch.where(valid_mask == 1, 
+                                 diff_k, torch.zeros_like(diff_k) - 1)
+
+            # TODO: handle right padding problem during top K. (self.blend_len)
+            imp_indices[:] = torch.topk(diff_k, k=self.blend_len, dim=-1).indices
+            # blender shall always blend the last token, so that the generation can be executed smoothly!
+            last_token_idx = torch.sum(valid_mask, dim=1) - 1
+            # imp_indices[:, -1] = last_token_idx
+            batch_size = imp_indices.shape[0]
+            imp_indices = torch.where(self.last_token_idx.unsqueeze(0).expand(batch_size, -1), 
+                                      last_token_idx.reshape(-1, 1).expand(-1, self.blend_len),
+                                      imp_indices)
+            k = torch.gather(k, dim=2, 
+                             index=imp_indices.unsqueeze(1).unsqueeze(3).expand(-1, self.n_kv_heads, -1, self.head_dim))
+            v = torch.gather(v, dim=2, 
+                             index=imp_indices.unsqueeze(1).unsqueeze(3).expand(-1, self.n_kv_heads, -1, self.head_dim))
+            q = torch.gather(q, dim=2, 
+                             index=imp_indices.unsqueeze(1).unsqueeze(3).expand(-1, self.n_heads, -1, self.head_dim))
+            atten_mask = torch.gather(atten_mask, dim=-2, 
+                                      index=imp_indices.unsqueeze(-1).expand(-1, -1, self.max_context_len))
+        # update KV caches
+        cache_indices = imp_indices.unsqueeze(1).unsqueeze(1).expand(-1, self.n_kv_heads, self.head_dim, -1) + self.max_context_len - self.ar_len
+        k_caches = k_caches.scatter(dim=3, src=k.transpose(2, 3), index=cache_indices) 
+        v_caches = v_caches.scatter(dim=2, src=v, index=cache_indices.transpose(2, 3))
+        # print(f"layer: {self.layer_idx}, k: {k[0,0,-self.ar_len:,0]}, v: {v[0,0,-self.ar_len:,0]}")          
+        # print(f"layer: {self.layer_idx}, kv: {k_caches[0,0,0,-self.ar_len:]} {v_caches[0,0,-self.ar_len:,0]}")          
+        return q, k, v, atten_mask, k_caches, v_caches, imp_indices                       
 
 
 class FeedForward(nn.Module):
@@ -565,14 +654,19 @@ class FeedForward(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
+    def __init__(self, layer_idx: int, ar_len: int, config: ModelArgs, output_new_cache_only=False):
         super().__init__()
         self.dim = config.dim
+        self.ar_len = ar_len
         self.attention = LlamaAttention(
             layer_idx=layer_idx,
+            ar_len=self.ar_len,
             config=config,
             output_new_cache_only=output_new_cache_only,
         )
+        self.layer_idx = layer_idx
+        self.use_blend = config.use_blend
+        self.blend_len = config.blend_len
 
         self.feed_forward = FeedForward_REGISTRY.get(
             config.model_architecture, FeedForward
@@ -606,17 +700,22 @@ class LlamaDecoderLayer(nn.Module):
         atten_mask: torch.Tensor,
         k_caches: List[torch.Tensor],
         v_caches: List[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+        imp_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
         hidden_states = self.attention_norm(x)
-        h, k_cache, v_cache = self.attention(
+        h, k_cache, v_cache, imp_indices = self.attention(
             hidden_states=hidden_states,
             freqs_cos=freqs_cos,
             freqs_sin=freqs_sin,
             atten_mask=atten_mask,
             k_caches=k_caches,
             v_caches=v_caches,
+            valid_mask = valid_mask,
+            imp_indices=imp_indices
         )
+        if self.use_blend and self.layer_idx == 0:
+            x = torch.gather(x, dim=1, index=imp_indices.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
         if self.post_attention_norm:
             h = self.post_attention_norm(h)
         h = (
@@ -633,8 +732,8 @@ class LlamaDecoderLayer(nn.Module):
             if self.residual_multiplier is not None
             else h + out
         )
-
-        return output, k_cache, v_cache
+        
+        return output, k_cache, v_cache, imp_indices
 
 
 class LlamaModel(nn.Module):
@@ -666,10 +765,12 @@ class LlamaModel(nn.Module):
         self.output_cache = output_cache
         self.kv_io_bit_width = config.kv_io_bit_width
         self.logits_scaling = config.logits_scaling
+        self.use_blend = config.use_blend
+        self.blend_len = config.blend_len
 
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(i, config, self.output_new_cache_only)
+                LlamaDecoderLayer(i, self.ar_len, config, self.output_new_cache_only)
                 for i in range(config.n_layers)
             ]
         )
@@ -729,6 +830,11 @@ class LlamaModel(nn.Module):
         freqs_sin = (
             self.freqs_sin[input_pos][0] if self.use_kv_cache else self.freqs_sin
         )
+        imp_indices = None
+        if self.use_blend:
+            imp_indices = torch.arange(self.blend_len, 
+                                       dtype=torch.int32, device="cpu"
+                                      ).unsqueeze(0).repeat(self.max_batch_size, 1)
 
         hidden_states = self.embedding_scale_factor * self.tok_embeddings(tokens)
 
@@ -741,16 +847,32 @@ class LlamaModel(nn.Module):
                 k_caches = args[offset_k]
                 v_caches = args[offset_v]
 
-            hidden_states, k, v = decoder_layer(
+            valid_mask = args[self.n_layers*2] if self.use_blend else None
+            if self.use_blend and ind > 0:
+                # for non-check layers in blender, it selects HKVD to recompute.
+                freqs_cos = (
+                    self.freqs_cos[torch.gather(input_pos, dim=-1, index=imp_indices)][0] if self.use_kv_cache else self.freqs_cos
+                )
+                freqs_sin = (
+                    self.freqs_sin[torch.gather(input_pos, dim=-1, index=imp_indices)][0] if self.use_kv_cache else self.freqs_sin
+                )
+
+            hidden_states, k, v, imp_indices = decoder_layer(
                 hidden_states,
                 freqs_cos=freqs_cos,
                 freqs_sin=freqs_sin,
                 atten_mask=atten_mask,
                 k_caches=k_caches,
                 v_caches=v_caches,
+                valid_mask=valid_mask,
+                imp_indices=imp_indices
             )
             output_k_cache.extend(k)
             output_v_cache.extend(v)
+
+            if self.use_blend and ind==0:
+                atten_mask = torch.gather(atten_mask, dim=-2, 
+                                          index=imp_indices.unsqueeze(-1).expand(-1, -1, self.max_context_len))
 
         hidden_states = self.norm(hidden_states)
         logits = self.output(hidden_states)
@@ -759,6 +881,8 @@ class LlamaModel(nn.Module):
             logits = logits / self.logits_scaling
 
         if self.output_cache:
+            if self.use_blend:
+                return logits, output_k_cache, output_v_cache, imp_indices
             return logits, output_k_cache, output_v_cache
         return logits
 
@@ -780,16 +904,26 @@ class LlamaModel(nn.Module):
                         self.max_batch_size,
                         self.n_kv_heads,
                         self.head_dim,
-                        self.max_context_len - self.ar_len,
+                        self.max_context_len if self.use_blend else self.max_context_len - self.ar_len,
                     )
                 )
                 v_cache.append(
                     torch.zeros(
                         self.max_batch_size,
                         self.n_kv_heads,
-                        self.max_context_len - self.ar_len,
+                        self.max_context_len if self.use_blend else self.max_context_len - self.ar_len,
                         self.head_dim,
                     )
+                )
+            if self.use_blend:
+                valid_mask = torch.zeros((self.max_batch_size, self.ar_len), dtype=torch.int32)
+                return (
+                    tokens,
+                    atten_mask,
+                    pos_ids,
+                    k_cache,
+                    v_cache,
+                    valid_mask
                 )
             return (
                 tokens,
@@ -821,6 +955,7 @@ class LlamaModel(nn.Module):
             "get_vocab_size": self.vocab_size,
             "get_use_kv_cache": self.use_kv_cache,
             "get_kv_io_bit_width": self.kv_io_bit_width,
+            "get_blend_len": self.blend_len
         }
 
 

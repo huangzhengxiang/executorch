@@ -31,6 +31,7 @@ TEXT_EMBEDDING_GRAPH_NAMES = [
 ]
 # Decoder graph names
 DECODER_GRAPH_NAMES = ["kv_forward", "prefill_forward"]
+BLENDER_DECODER_GRAPH_NAMES = ["kv_forward", "prefill_forward", "blender_forward"]
 
 
 # evaluation mode
@@ -38,6 +39,7 @@ EVAL_MODE = {
     "kv": 0,
     "hybrid": 1,
     "lookahead": 2,
+    "blender": 3
 }
 # The dict's value is mainly for runner to decide what special tokens are required to wrap the prompt.
 DECODER_MODEL_VERSION = {

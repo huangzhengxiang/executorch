@@ -36,6 +36,7 @@ from .fuse_consecutive_cast import FuseConsecutiveCast
 from .fuse_consecutive_transpose import FuseConsecutiveTranspose
 from .i64_to_i32 import I64toI32
 from .insert_io_qdq import InsertIOQDQ
+from .insert_float_path import InsertFloatPath
 from .insert_requantize import InsertRequantize
 from .insert_reshape_for_reduce_ops import InsertReshapeForReduceOps
 from .layout_transform import LayoutTransform
@@ -83,6 +84,7 @@ __all__ = [
     FuseConsecutiveCast,
     FuseConsecutiveTranspose,
     I64toI32,
+    InsertFloatPath,
     InsertIOQDQ,
     InsertReshapeForReduceOps,
     InsertRequantize,

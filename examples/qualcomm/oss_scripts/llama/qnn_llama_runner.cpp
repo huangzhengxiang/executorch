@@ -86,6 +86,14 @@ DEFINE_int32(
     gcap,
     0,
     "[Lookahead Decoding] Represents the maximum number of speculations or candidate n-grams that the algorithm considers in each step for verification. It balances the trade-off between computation efficiency and exploring more possibilities.");
+DEFINE_bool(
+    kv_store,
+    false,
+    "store the kv to disk then load them.");
+DEFINE_int32(
+    test_level,
+    false,
+    "determine the debug test level.");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -232,6 +240,8 @@ void start_runner(
       FLAGS_ngram,
       FLAGS_window,
       FLAGS_gcap,
+      FLAGS_kv_store,
+      FLAGS_test_level,
       nullptr,
       std::move(attention_sink_rope_module));
   auto decoder_model_version = runner.get_decoder_model_version();

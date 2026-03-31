@@ -7,6 +7,7 @@
 import copy
 from typing import Any, Dict, Tuple
 
+from executorch.backends.qualcomm.quantizer.annotators import _is_float_tensor
 import executorch.backends.qualcomm.python.PyQnnManagerAdaptor as PyQnnManager
 
 import numpy as np
@@ -52,8 +53,8 @@ QNN_QUANT_TYPE_MAP = {
     torch.int8: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_SFIXED_POINT_8,
     torch.int16: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_SFIXED_POINT_16,
     torch.int32: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_SFIXED_POINT_32,
-    # Note that there is no int64 tensor data type in Qnn.
-    torch.int64: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_UNDEFINED,
+    # Note that there is no int64 tensor data type as parameter in Qnn.
+    torch.int64: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_32,
     torch.uint8: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_UFIXED_POINT_8,
     torch.uint16: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_UFIXED_POINT_16,
 }
@@ -65,7 +66,8 @@ QNN_TENSOR_TYPE_MAP = {
     torch.int8: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_8,
     torch.int16: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_16,
     torch.int32: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_32,
-    torch.int64: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_64,
+    # Note that there is no int64 tensor data type as parameter in Qnn.
+    torch.int64: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_32,
     torch.uint8: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_UINT_8,
     torch.uint16: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_UINT_16,
     torch.uint32: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_UINT_32,
@@ -117,14 +119,28 @@ class NodeVisitor:
         """
         Utility to skip dequantize node for frozen param
         """
-        return node.args[0] if node is not None and node.target in dq_ops else node
+        need_skip = (node is not None and node.target in dq_ops
+                     and not any(
+                        (user.meta.get(QCOM_QUANT_ATTRS) is None 
+                        and user.op != "output"
+                        and _is_float_tensor(user)) 
+                        for user in node.users
+                    ))
+        return node.args[0] if need_skip else node
 
     def get_first_user(self, node):
         """
         Utility to skip dequantize user for frozen param
         """
         user_0 = list(node.users)[0]
-        return user_0 if user_0.target not in dq_ops else self.get_first_user(user_0)
+        need_skip = (user_0.target in dq_ops
+                     and not any(
+                        (user.meta.get(QCOM_QUANT_ATTRS) is None 
+                        and user.op != "output"
+                        and _is_float_tensor(user)) 
+                        for user in user_0.users
+                    ))
+        return user_0 if not need_skip else self.get_first_user(user_0)
 
     def get_tensor(self, input_node, op_node, idx=None):
         """
@@ -474,6 +490,15 @@ class NodeVisitor:
             tensor_source_node, target_build_node
         )
         dtype = self.get_data_type(tensor, quant_configs)
+        # if "scatter" in target_build_node.name:
+        print(tensor_source_node.name if tensor_source_node.name is not None else "", 
+                target_build_node.name if target_build_node.name is not None else "", 
+                quant_encoding,
+                deduce_dtype(tensor, quant_configs) if quant_configs else "",
+                quant_configs["quant_min"] if quant_configs else "",
+                quant_configs["quant_max"] if quant_configs else "",
+                quant_configs["dtype"] if quant_configs else "",
+                dtype)
         if isinstance(tensor, torch._subclasses.fake_tensor.FakeTensor):
             tensor_wrapper = PyQnnManager.TensorWrapper(
                 tensor_name,

@@ -73,6 +73,7 @@ def get_passes_dependency_for_capture_program():
         ExpandBroadcastTensorShape,
         FixedLinearKeepDim,
         FoldQDQ,
+        InsertFloatPath,
         I64toI32,
         LayoutTransform,
         RecomposePadMaxPool2d,
@@ -99,6 +100,7 @@ def get_passes_dependency_for_capture_program():
         ExpandBroadcastTensorShape: [FoldQDQ],
         FixedLinearKeepDim: [FoldQDQ],
         FoldQDQ: [AnnotateQuantAttrs, AnnotateStack, AnnotateUnbind],
+        InsertFloatPath: [FoldQDQ, I64toI32],
         I64toI32: [RemoveRedundancy],
         LayoutTransform: [
             AnnotateQuantAttrs,

@@ -24,6 +24,7 @@ from executorch.backends.qualcomm._passes.utils import (
 from executorch.backends.qualcomm.builders.utils import is_graph_output
 from executorch.backends.qualcomm.quantizer.custom_annotation import (
     annotate_prefill_kv_output,
+    annotate_blend
 )
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 from executorch.backends.qualcomm.utils.constants import (
@@ -49,6 +50,7 @@ from executorch.examples.qualcomm.oss_scripts.llama import (
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
     DECODE_QDQ_FILENAME,
+    BLENDER_DECODER_GRAPH_NAMES,
     DECODER_GRAPH_NAMES,
     TEXT_DECODER,
     TEXT_EMBEDDING,
@@ -111,6 +113,7 @@ class TextDecoder(Component):
         self.quant_recipe: StaticLLMQuantRecipe = (
             self.config.quant_recipe(True) if self.config.quant_recipe else None
         )
+        self.blend_config = None
 
         # For multimodal embedding
         self._modality_placeholder_token_id = None
@@ -310,6 +313,7 @@ class TextDecoder(Component):
             *((self.example_input[2],) if decoder.use_kv_cache else []),  # pos_ids
             *(self.example_input[3] if decoder.use_kv_cache else []),  # k_caches
             *(self.example_input[4] if decoder.use_kv_cache else []),  # v_caches
+            *((self.example_input[5],) if decoder.use_blend else []),  # valid_mask
         )
         self.io_shape = {
             # logit output
@@ -328,6 +332,10 @@ class TextDecoder(Component):
             (self.meta["get_head_dim"], self.meta["get_ar_len"]),
             (self.meta["get_ar_len"], self.meta["get_head_dim"]),
         }
+        if decoder.use_blend:
+            self.blend_config = {
+                "blend_len": decoder.blend_len
+            }
 
         if self.apply_embedding:
             self.tok_embedding_export_input = (
@@ -412,6 +420,7 @@ class TextDecoder(Component):
                     v_idx += 1
 
     def _tag_ios(self, node, fixed_point_type):
+        # For blender, no need to quant valid_mask and imp_indices.
         atten_mask_shape = {
             (
                 self.meta["get_max_batch_size"],
@@ -431,8 +440,9 @@ class TextDecoder(Component):
 
         if node.op == "placeholder":
             if (
-                len(users := list(node.users)) == 1
+                (len(users := list(node.users)) == 1 or "args" in node.name)
                 and users[0].meta["val"].size()[-2:] in self.kv_cache_shape
+                and "constant" not in node.name
             ):
                 quant_io_type = fixed_point_type["kv_type"]
             elif node.meta["val"].size() in self.io_shape:
@@ -456,6 +466,8 @@ class TextDecoder(Component):
         if node.target in freq_op and node.meta["val"].size() in freq_shape:
             quant_io_type = fixed_point_type["io_type"]
 
+        if ("args" in node.name):
+            print(f"tag_ios, args, {node.name}, {quant_io_type}")
         return quant_io_type
 
     def _calibrate(
@@ -491,7 +503,8 @@ class TextDecoder(Component):
 
         # Task-based calibration: Only for text-only LLMs
         # Multimodal models (VLMs) cannot use task-based evaluation currently.
-        if has_task_calibration and not is_multimodal:
+        # BLENDER do not need task-based evaluation.
+        if has_task_calibration and not is_multimodal and self.mode != Mode.BLENDER:
             graph_module_inference(
                 use_kv_cache=self.meta["get_use_kv_cache"],
                 get_example_inputs=self.get_example_inputs,
@@ -505,6 +518,7 @@ class TextDecoder(Component):
                 use_i64_token=self.control_args.embedding_quantize is not None,
                 event_name=f"{event}_tasks",
                 seq_mse_candidates=self.config.seq_mse_candidates,
+                blend_config=self.blend_config
             )
 
         # prepare lookahead config if applicable
@@ -516,6 +530,8 @@ class TextDecoder(Component):
             else None
         )
         # check user's prompt which helps calibrate special token
+        print("self.mode: ", self.mode)
+        print()
         for prompt in user_calibration_data:
             graph_module_inference(
                 use_kv_cache=self.meta["get_use_kv_cache"],
@@ -533,6 +549,7 @@ class TextDecoder(Component):
                 use_i64_token=self.control_args.embedding_quantize is not None,
                 event_name=f"{event}_prompt",
                 lookahead_config=lookahead_config,
+                blend_config=self.blend_config
             )
 
     @log_info
@@ -575,6 +592,8 @@ class TextDecoder(Component):
         quantizer = make_quantizer()
         for custom_annotation in data.custom_annotation:
             self.quant_recipe.recipe.custom_quant_annotations.append(custom_annotation)
+        if self.mode == Mode.BLENDER:
+            self.quant_recipe.recipe.custom_quant_annotations.append(annotate_blend)
         quantizer.recipe = self.quant_recipe
 
         text_embedding_quantizer = make_quantizer(
@@ -614,14 +633,22 @@ class TextDecoder(Component):
             )
             self.decoder = convert_pt2e(self.decoder)
 
+            for node in self.decoder.graph.nodes:
+                print(node.name)
+                print("  op:", node.op)
+                print("  args:", node.args)
+                print("  target:", node.target)
+                # print("  meta:", node.meta)
+                print("\n\n\n")
+
             # Saving Decode QDQ Model EP for SQNR evaluation
-            if self.mode == Mode.DECODE:
-                qdq_ep = torch.export.export(
-                    self.decoder, self.export_input, strict=True
-                )
-                qdq_ep_path = f"{self.control_args.artifact}/{DECODE_QDQ_FILENAME}"
-                torch.export.save(qdq_ep, qdq_ep_path)
-                logging.info(f"QDQ EP saved to {qdq_ep_path}")
+            # if self.mode == Mode.DECODE:
+            #     qdq_ep = torch.export.export(
+            #         self.decoder, self.export_input, strict=True
+            #     )
+            #     qdq_ep_path = f"{self.control_args.artifact}/{DECODE_QDQ_FILENAME}"
+            #     torch.export.save(qdq_ep, qdq_ep_path)
+            #     logging.info(f"QDQ EP saved to {qdq_ep_path}")
 
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
@@ -705,7 +732,19 @@ class HybridTextDecoder(Component):
         )
         self.control_args = control_args
         self.config = config
-        self.set_next(self.decode).set_next(self.prefill)
+
+        if control_args.model_mode == "blender":
+            self.blender = TextDecoder(
+                control_args,
+                config,
+                Mode.BLENDER,
+                apply_embedding=apply_embedding,
+            )
+            self.set_next(self.decode).set_next(self.prefill).set_next(self.blender)
+            # self.set_next(self.blender) # debug
+            # self.set_next(self.decode).set_next(self.prefill) # debug
+        else:
+            self.set_next(self.decode).set_next(self.prefill)
 
         self.apply_embedding = apply_embedding
 
@@ -713,8 +752,7 @@ class HybridTextDecoder(Component):
     def compile(self, request: Request):  # noqa: C901
         # force overriding frozen parameters here for model quantizing under seq mse scenario
         # this will make weight sharing work properly
-        if self.config.seq_mse_candidates != 0 and self.control_args.model_mode != "kv":
-            decode, prefill = self.decode.decoder, self.prefill.decoder
+        def override_params(decode, prefill):
             override_nodes = {
                 str(node.meta["nn_module_stack"].values()): node
                 for node in prefill.graph.nodes
@@ -747,12 +785,24 @@ class HybridTextDecoder(Component):
                     else:
                         raise RuntimeError("failed to override quantization attribute")
 
+        if self.config.seq_mse_candidates != 0 and self.control_args.model_mode != "kv":
+            decode, prefill = self.decode.decoder, self.prefill.decoder
+            override_params(decode, prefill)
+            if self.control_args.model_mode == "blender":
+                blender = self.blender.decoder
+                override_params(decode, blender)
+
         # prepare lowering tok_embedding if applicable
         if self.apply_embedding:
             tok_embedding_data = request.method_data[TEXT_EMBEDDING]
-            models = [
-                d for d in [self.decode, self.prefill] if d.tok_embedding is not None
-            ]
+            if self.control_args.model_mode == "blender":
+                models = [
+                    d for d in [self.decode, self.prefill, self.blender] if d.tok_embedding is not None
+                ]
+            else:
+                models = [
+                    d for d in [self.decode, self.prefill] if d.tok_embedding is not None
+                ]                
             tok_embedding_example_inputs = [
                 m.tok_embedding_export_input for m in models if m is not None
             ]  # tokens
@@ -760,9 +810,13 @@ class HybridTextDecoder(Component):
 
         # prepare lowering decoder
         data = request.method_data[TEXT_DECODER]
-        models = [d for d in [self.decode, self.prefill] if d.decoder is not None]
+        if self.control_args.model_mode == "blender":        
+            models = [d for d in [self.decode, self.prefill, self.blender] if d.decoder is not None]
+            graph_names = BLENDER_DECODER_GRAPH_NAMES[: len(models)]
+        else:
+            models = [d for d in [self.decode, self.prefill] if d.decoder is not None]
+            graph_names = DECODER_GRAPH_NAMES[: len(models)]
         example_inputs = [m.export_input for m in models if m is not None]
-        graph_names = DECODER_GRAPH_NAMES[: len(models)]
 
         # start lowering
         if self.apply_embedding:

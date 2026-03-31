@@ -363,6 +363,8 @@ class QnnQuantizer(Quantizer):
 
         print(f"No quant config is implemented for op, {op}")
 
+        return None
+
     def add_custom_quant_annotations(
         self, custom_quant_annotations: Sequence[Callable]
     ) -> None:

@@ -801,6 +801,29 @@ def annotate_slice_scatter(node: Node, quantization_config: QuantizationConfig) 
         _annotated=True,
     )
 
+@register_annotator([torch.ops.aten.scatter.src])
+def annotate_scatter(node: Node, quantization_config: QuantizationConfig) -> None:
+    # (dst, dim, index, src)
+    input = node.args[0]
+    value = node.args[1]
+    index = node.args[2]
+    src = node.args[3]
+
+    print(node.name, ", is float: ", _is_float_tensor(input) or _is_float_tensor(src))
+
+    # Only quantize if input is a float tensor
+    if not _is_float_tensor(input) and not _is_float_tensor(src):
+        return
+
+    input_qspec_map = {}
+    input_qspec_map[input] = quantization_config.input_activation
+    input_qspec_map[src] = quantization_config.input_activation
+
+    node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+        input_qspec_map=input_qspec_map,
+        output_qspec=SharedQuantizationSpec((input, node)),
+        _annotated=True,
+    )
 
 @register_annotator([torch.ops.aten.sqrt.default])
 def annotate_sqrt(node: Node, quantization_config: QuantizationConfig) -> None:

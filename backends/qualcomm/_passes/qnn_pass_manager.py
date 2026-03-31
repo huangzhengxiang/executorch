@@ -40,6 +40,7 @@ from executorch.backends.qualcomm._passes import (
     FuseConsecutiveCast,
     FuseConsecutiveTranspose,
     I64toI32,
+    InsertFloatPath,
     InsertIOQDQ,
     InsertRequantize,
     InsertReshapeForReduceOps,
@@ -100,6 +101,7 @@ def get_capture_program_passes():
         (FixedLinearKeepDim, True),
         (FoldQDQ, True),
         (I64toI32, True),
+        (InsertFloatPath, True),
         (LayoutTransform, True),
         (RecomposePadMaxPool2d, True),
         (RecomposePixelUnshuffle, True),
@@ -258,6 +260,7 @@ class QnnPassManager(PassManager):
             self.add_pass(ConvertMhaToSha(exported_program))
         self.add_pass(InsertRequantize())
         self.add_pass(InsertIOQDQ(exported_program))
+        self.add_pass(InsertFloatPath(exported_program))
         self.add_pass(LayoutTransform(exported_program, insert_permute=True))
         self.add_pass(FuseConsecutiveCast())
         self.add_pass(FuseConsecutiveTranspose())

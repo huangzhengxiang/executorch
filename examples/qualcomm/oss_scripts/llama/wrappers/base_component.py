@@ -37,6 +37,7 @@ from transformers import AutoConfig
 class Mode(Enum):
     PREFILL = 1
     DECODE = 2
+    BLENDER = 3
 
 
 def is_node_src_start_with_name(node: torch.fx.Node, prefix: str) -> bool:
@@ -133,6 +134,11 @@ def process_model_args(
     model_args.enable_r3 = config.r3
     model_args.ar_len = ar_len
     model_args.kv_io_bit_width = quant_recipe.get_kv_io_bit_width()
+
+    model_args.blend_len = control_args.blend_len
+    if mode == Mode.BLENDER and \
+        (control_args.model_mode == "hybrid" or control_args.model_mode == "blender"):
+        model_args.use_blend = True
 
     if config.masked_softmax:
         if is_qnn_sdk_version_less_than("2.35"):

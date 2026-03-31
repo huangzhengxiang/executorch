@@ -10,6 +10,7 @@ import torch
 from executorch.backends.qualcomm.quantizer.annotators import (
     _is_float_tensor,
     Q_ANNOTATION_KEY,
+    OP_ANNOTATOR
 )
 from executorch.backends.qualcomm.quantizer.quantizer import (
     get_16a8w_qnn_ptq_config,
@@ -93,9 +94,23 @@ def annotate_mimi_decoder(gm: torch.fx.GraphModule):
 
 
 def annotate_prefill_kv_output(gm: torch.fx.GraphModule, kv_quant_attrs: dict):
+    """
+    Annotates prefill KV outputs for quantization, with special handling for 
+    outputs that should not be quantized (like imp_indices) and inputs that 
+    should not be quantized (like valid_mask).
+    
+    Args:
+        gm: The graph module to annotate
+        kv_quant_attrs: Dictionary mapping output indices to quantization attributes
+                       for KV cache outputs that should be quantized
+    """
     for node in gm.graph.nodes:
         if node.op == "output":
             for index, prefill_output in enumerate(node.args[0]):
+                # Check if this output should be quantized based on kv_quant_attrs
+                if index not in kv_quant_attrs:
+                    continue
+                # Apply quantization for KV cache outputs
                 kv_quant_attr = kv_quant_attrs[index]
                 fixed_observer = FixedQParamsObserver.with_args(
                     scale=kv_quant_attr[0],
@@ -116,7 +131,7 @@ def annotate_prefill_kv_output(gm: torch.fx.GraphModule, kv_quant_attrs: dict):
 
                 input_qspec_map = {}
                 for input in prefill_output.args:
-                    if isinstance(input, Node):
+                    if _is_float_tensor(input):
                         input_qspec_map[input] = fixed_output_spec
 
                 prefill_output.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
@@ -124,7 +139,74 @@ def annotate_prefill_kv_output(gm: torch.fx.GraphModule, kv_quant_attrs: dict):
                     output_qspec=fixed_output_spec,
                     _annotated=True,
                 )
+                # Skip annotation for outputs not in kv_quant_attrs (e.g., imp_indices)
+                print("annotate prefill kv output: ", prefill_output.name)
 
+def annotate_blend(  # noqa: C901
+    gm: torch.fx.GraphModule,
+    is_qat=False,
+) -> None:
+    print("annotating blender")
+    def annotate_topk(node):
+        if is_qat:
+            quantization_config_8a8w = get_8a8w_qnn_qat_config(
+                act_symmetric=True, act_observer=MinMaxObserver
+            )
+        else:
+            quantization_config_8a8w = get_8a8w_qnn_ptq_config(
+                act_symmetric=True, act_observer=MinMaxObserver
+            )
+        while isinstance(node, Node) and node.op == "call_function":
+            if node.target in [
+                torch.ops.aten.topk.default,
+                torch.ops.aten.permute.default,
+                torch.ops.aten.squeeze.dim,
+                torch.ops.aten.transpose.int,
+                torch.ops.aten.view.default,
+                torch.ops.aten.reshape.default,
+                torch.ops.aten.select.int,
+                torch.ops.aten.slice.Tensor,
+                torch.ops.aten.expand.default,
+                torch.ops.aten.unsqueeze.default,
+                torch.ops.aten.pow.Tensor_Tensor,
+                torch.ops.aten.sum.dim_IntList,
+                torch.ops.aten.sum.default,
+                torch.ops.aten.copy_.default,
+                torch.ops.aten.fill_.Tensor
+            ]:
+                node.meta.pop(Q_ANNOTATION_KEY, None)
+                node = node.args[0]
+            elif node.target == torch.ops.aten.where.self:
+                node.meta.pop(Q_ANNOTATION_KEY, None)
+                # trace diff_k (1), do not quant zeros_like(diff_k) (2)
+                zeros_node = node.args[2]
+                zeros_node.meta.pop(Q_ANNOTATION_KEY, None)
+                zeros_node.args[0].meta.pop(Q_ANNOTATION_KEY, None)
+                # trace diff_k (1)
+                node = node.args[1]
+            elif node.target in [
+                torch.ops.aten.sub.Tensor,
+            ]:
+                # stop at first diff k calculation
+                # k.transpose(2, 3) (uint16) ->  QNN cast (fp32)  -> 
+                # k_caches slice (uint8)     ->  QNN cast (fp32)  ->  sub (fp32)  ->  sum (fp32) -> ... 
+                node.meta.pop(Q_ANNOTATION_KEY, None)
+                input_node, cache_node = node.args[0], node.args[1]
+                input_node.meta.pop(Q_ANNOTATION_KEY, None)
+                cache_node.meta.pop(Q_ANNOTATION_KEY, None)
+                OP_ANNOTATOR[input_node.target](input_node, quantization_config_8a8w)
+                OP_ANNOTATOR[cache_node.target](cache_node, quantization_config_8a8w)
+                break
+            else:
+                print(f"The node ({node}) is not expected in the input0 of blender topk")
+                node.meta.pop(Q_ANNOTATION_KEY, None)
+                node = node.args[0]
+    for node in gm.graph.nodes:
+        if (
+            node.target == torch.ops.aten.topk.default
+        ):
+            # Only apply custom annotation on Q @ K^T @ V
+            annotate_topk(node)
 
 def annotate_kv_8bit(  # noqa: C901
     gm: torch.fx.GraphModule,
@@ -278,6 +360,15 @@ def annotate_kv_8bit(  # noqa: C901
                 # For k, we tag 8a until add or sub op (rotatary embedding).
                 # The arguments of cat op: (the past kv cache, the new kv cache)
                 node = node.args[0][1]
+            elif node.target == torch.ops.aten.gather.default:
+                # dot not quant, directly lower to int gather
+                OP_ANNOTATOR[node.target](node, quantization_config_8a8w)
+                node = node.args[0]
+            elif node.target == torch.ops.aten.scatter.src:
+                # dot not quant, directly lower to int scatter
+                OP_ANNOTATOR[node.target](node, quantization_config_8a8w)
+                # trace the scatter src (3)
+                node = node.args[3]
             elif node.target in [
                 torch.ops.aten.add.Tensor,
                 torch.ops.aten.sub.Tensor,

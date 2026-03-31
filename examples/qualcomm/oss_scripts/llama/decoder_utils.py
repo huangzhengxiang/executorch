@@ -26,6 +26,12 @@ except ImportError:
         "Please install the llm eval dependency via examples/models/llama/install_requirements.sh"
     )
 
+import pickle
+def common_prefix_len(a, b):
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return min(len(a), len(b))
 
 INFERENCE_REGISTRY = {}
 
@@ -94,6 +100,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         get_example_inputs: Callable,
         use_i64_token: bool,
         seq_mse_candidates: int,
+        blend_config
     ):
         # n seq len = n-1 cache len, so we len(inps) = n-1 during _model_call
         assert max_seq_length is not None, "max_seq_length must be provided"
@@ -107,6 +114,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         self.max_seq_length = max_seq_length
         self.use_i64_token = use_i64_token
         self.seq_mse_candidates = seq_mse_candidates
+        self.blend_config = blend_config
 
     def _model_call(self, inps):
         all_logits = None
@@ -114,6 +122,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         if self._use_kv_cache:
             kwargs["ar_len"] = self.ar_len
             kwargs["seq_mse_candidates"] = self.seq_mse_candidates
+            kwargs["blend_config"] = self.blend_config
 
         all_logits = INFERENCE_REGISTRY[self._use_kv_cache](
             self.get_example_inputs,
@@ -383,9 +392,29 @@ def _prefill_chunking(
     k_caches,
     v_caches,
     total_token_list,
+    blend_config
 ):
     with torch.no_grad():
+        kv_store = []
+        if blend_config is not None:
+            debug_fd = open("debug.pickle", "rb")
+            while True:
+                try:
+                    obj = pickle.load(debug_fd)
+                    kv_store.append(obj)
+                except EOFError:
+                    break
+            
+            debug_fd.close()
+            for kv in kv_store:
+                if common_prefix_len(kv["tokens"], total_token_list) == len(total_token_list):
+                    precomputed_k = kv["k_caches"]
+                    precomputed_v = kv["v_caches"]
+                    break
+
+        device = device = next(module.parameters()).device
         num_prompt_tokens = len(total_token_list)
+        print("prefill total token len: ", num_prompt_tokens)
         pos = 0  # Tracks how many prompt tokens have been processed.
         while pos < num_prompt_tokens:
             chunk_start_idx, chunk_end_idx = pos, min(num_prompt_tokens, pos + ar_len)
@@ -395,7 +424,7 @@ def _prefill_chunking(
                 actual_chunk_tokens = inputs.input_ids[chunk_start_idx:chunk_end_idx]
                 num_tokens_in_chunk = len(actual_chunk_tokens)
                 # Prepare tmp_token_list (padded with zeros).
-                tmp_token_list = torch.zeros((1, ar_len), dtype=inputs.input_ids_dtype)
+                tmp_token_list = torch.zeros((1, ar_len), dtype=inputs.input_ids_dtype, device=device)
                 tmp_token_list[0, :num_tokens_in_chunk] = torch.tensor(
                     actual_chunk_tokens, dtype=inputs.input_ids_dtype
                 )
@@ -405,38 +434,89 @@ def _prefill_chunking(
                 ]
                 num_tokens_in_chunk = actual_chunk_tokens.shape[1]
                 # Prepare tmp_token_list (padded with zeros).
-                tmp_embedding = torch.zeros((1, ar_len, inputs.embedding.shape[-1]))
+                tmp_embedding = torch.zeros((1, ar_len, inputs.embedding.shape[-1]), device=device)
                 tmp_embedding[0, :num_tokens_in_chunk, :] = torch.tensor(
                     actual_chunk_tokens
                 )
 
             # Prepare tmp_pos (padded with zeros).
-            tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
+            tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32, device=device)
             tmp_pos[0, :num_tokens_in_chunk] = inputs.all_pos[
                 0,
                 pos : pos + num_tokens_in_chunk,
             ]
 
-            # Run inference.
-            if inputs.input_ids is not None:
-                logits, new_k_caches, new_v_caches = module(
-                    tmp_token_list,
-                    *inputs.atten_mask,
-                    tmp_pos,
-                    *k_caches,
-                    *v_caches,
-                )
-            else:
-                logits, new_k_caches, new_v_caches = module(
-                    tmp_embedding,
-                    *inputs.atten_mask,
-                    tmp_pos,
-                    *k_caches,
-                    *v_caches,
-                )
-            if collect_logits:
-                result_logits.append(logits[:, :num_tokens_in_chunk])
+            valid_mask = torch.zeros((1, ar_len), dtype=torch.int32)
+            valid_mask[:] = (torch.arange(ar_len) < num_tokens_in_chunk)
 
+            if blend_config is not None:
+                precomputed_start = chunk_start_idx
+                precomputed_end = chunk_end_idx
+                kv_load_start = -ar_len
+                kv_load_end = None if ar_len == num_tokens_in_chunk else -ar_len + num_tokens_in_chunk
+                print(kv_load_start, kv_load_end, precomputed_start, precomputed_end, precomputed_k[0].shape)
+                for layer in range(len(k_caches)):
+                    k_caches[layer][:,:,:,kv_load_start:kv_load_end] = precomputed_k[layer][:,:,:,precomputed_start:precomputed_end]
+                    v_caches[layer][:,:,kv_load_start:kv_load_end,:] = precomputed_v[layer][:,:,precomputed_start:precomputed_end,:]
+
+            # Run inference.
+            if blend_config is None:
+                if inputs.input_ids is not None:
+                    results = module(
+                        tmp_token_list,
+                        *inputs.atten_mask,
+                        tmp_pos,
+                        *k_caches,
+                        *v_caches
+                    )
+                else:
+                    results = module(
+                        tmp_embedding,
+                        *inputs.atten_mask,
+                        tmp_pos,
+                        *k_caches,
+                        *v_caches
+                    )
+            else:
+                if inputs.input_ids is not None:
+                    results = module(
+                        tmp_token_list,
+                        *inputs.atten_mask,
+                        tmp_pos,
+                        *k_caches,
+                        *v_caches,
+                        valid_mask
+                    )
+                else:
+                    results = module(
+                        tmp_embedding,
+                        *inputs.atten_mask,
+                        tmp_pos,
+                        *k_caches,
+                        *v_caches,
+                        valid_mask
+                    )                
+            if blend_config is None:
+                logits, new_k_caches, new_v_caches = results
+                if collect_logits:
+                    result_logits.append(logits[:, :num_tokens_in_chunk])
+            else:
+                logits, new_k_caches, new_v_caches, imp_indices = results
+                if collect_logits:
+                    result_logits.append(logits[:, :])
+                for layer in range(len(k_caches)):
+                    # update HKVD only
+                    k_caches[layer][:,:,:,chunk_start_idx:chunk_start_idx+ar_len] = k_caches[layer][:,:,:,-ar_len:]
+                    v_caches[layer][:,:,chunk_start_idx:chunk_start_idx+ar_len,:] = v_caches[layer][:,:,-ar_len:,:]
+                    _, n_kv_heads, head_dim, _ = k_caches[layer].shape
+                    cache_indices = imp_indices.unsqueeze(1).unsqueeze(1).expand(-1, n_kv_heads, head_dim, -1) + chunk_start_idx
+                    k_caches[layer] = k_caches[layer].scatter(dim=3, src=new_k_caches[layer], index=cache_indices)
+                    v_caches[layer] = v_caches[layer].scatter(dim=2, src=new_v_caches[layer], index=cache_indices.transpose(2, 3))
+                    # align the smart mask
+                    new_k_caches[layer] = k_caches[layer][:,:,:,chunk_start_idx:chunk_start_idx+ar_len]
+                    new_v_caches[layer] = v_caches[layer][:,:,chunk_start_idx:chunk_start_idx+ar_len,:]
+            
+            # TODO: blender do not support this.
             # We should have enough calibration data when generating last token if task was specified
             if seq_mse_candidates != 0 and pos == num_prompt_tokens - 1:
                 with SeqMSE(module, seq_mse_candidates):
@@ -468,9 +548,25 @@ def _prefill_chunking(
                 new_v_caches,
             )
 
+        # save for blender
+        if (ar_len > 1):
+            if blend_config is None:
+                debug_fd = open("debug.pickle", "ab")
+            else:
+                debug_fd = open("debug_blend.pickle", "ab")
+            pickle.dump({
+                "tokens": total_token_list,
+                "ori_pos": 0,
+                "k_caches": [torch.cat([k, new_k], dim=-1)[:,:,:,:len(total_token_list)] 
+                             for k, new_k in zip(k_caches, new_k_caches)],
+                "v_caches": [torch.cat([v, new_v], dim=2)[:,:,:len(total_token_list),:] 
+                             for v, new_v in zip(v_caches, new_v_caches)]
+            }, debug_fd)
+            debug_fd.close()            
+
         # Append the last run logits to the total_token_list.
         total_token_list.append(
-            torch.argmax(logits[:, num_tokens_in_chunk - 1], dim=-1).item()
+            torch.argmax(logits[:, (num_tokens_in_chunk - 1) if blend_config is None else -1 ], dim=-1).item()
         )
 
         return pos
@@ -487,12 +583,17 @@ def _generate(
     k_caches,
     v_caches,
     total_token_list,
-    lookahead_config,
-):
+    lookahead_config
+):  
+    print("_generate start at: ", pos, ", ", len(total_token_list))
+    prev_len = len(total_token_list)
+    print(tokenizer.decode(total_token_list[-1:]), end="")
+    device = device = next(module.parameters()).device
     max_cache_len = max_seq_len - ar_len
     num_tokens = len(total_token_list)
     if lookahead_config is None:
-        while total_token_list[-1] != tokenizer.eos_id and num_tokens < max_seq_len:
+        # generate at most 50 tokens to save calibration time.
+        while total_token_list[-1] != tokenizer.eos_id and num_tokens < min(max_cache_len, prev_len + 50):
             chunk_start_idx = min(pos, max_cache_len)
             # Take a chunk of generated tokens, up to ar_len length.
             chunk_end_idx = num_tokens
@@ -500,7 +601,7 @@ def _generate(
             num_tokens_in_chunk = len(actual_chunk_tokens)
 
             # Prepare tmp_token_list (padded with zeros).
-            tmp_token_list = torch.zeros((1, ar_len), dtype=inputs.input_ids_dtype)
+            tmp_token_list = torch.zeros((1, ar_len), dtype=inputs.input_ids_dtype, device=device)
             tmp_token_list[0, :num_tokens_in_chunk] = torch.tensor(
                 actual_chunk_tokens, dtype=inputs.input_ids_dtype
             )
@@ -510,7 +611,7 @@ def _generate(
                 embedding = text_embedding(tmp_token_list)
 
             # Prepare tmp_pos (padded with zeros).
-            tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
+            tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32, device=device)
             tmp_pos[0, :num_tokens_in_chunk] = inputs.all_pos[
                 0, chunk_start_idx:chunk_end_idx
             ]
@@ -544,6 +645,7 @@ def _generate(
             total_token_list.append(
                 torch.argmax(logits[:, num_tokens_in_chunk - 1], dim=-1).item()
             )
+            print(tokenizer.decode(total_token_list[-1:]), end="")
             num_tokens = len(total_token_list)
     else:
         # TODO: support batch decode if necessary
@@ -655,6 +757,7 @@ def kv_inference(  # noqa: C901
     collect_logits=False,
     seq_mse_candidates=0,
     lookahead_config=None,
+    blend_config=None
 ):
     is_multimodal = all(
         [
@@ -663,8 +766,17 @@ def kv_inference(  # noqa: C901
             modality_placeholder_token_id is not None,
         ]
     )
+    if blend_config is None:
+        _, atten_mask, _, k_caches, v_caches = get_example_inputs()
+    else:
+        _, atten_mask, _, k_caches, v_caches, _ = get_example_inputs()
 
-    _, atten_mask, _, k_caches, v_caches = get_example_inputs()
+    # device
+    device = next(module.parameters()).device
+    for mask in atten_mask.masks:
+        mask._mask = mask._mask.to(device)
+    k_caches = [k.to(device) for k in k_caches]
+    v_caches = [v.to(device) for v in v_caches]
 
     # TODO: change criteria & support batch inputs if necessary
     all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
@@ -745,6 +857,7 @@ def kv_inference(  # noqa: C901
     )
 
     # 4. decoder forward
+    print("ar_len: ", ar_len)
     with torch.no_grad():
         # Phase 1: Prefill the prompt in ar_len chunks.
         cur_pos = _prefill_chunking(
@@ -757,23 +870,25 @@ def kv_inference(  # noqa: C901
             k_caches,
             v_caches,
             total_token_list,
+            blend_config
         )
 
         # Phase 2: Generate tokens until the EOS token is generated or max_seq_len is reached.
         # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
-        _generate(
-            inputs,
-            cur_pos,
-            module,
-            tokenizer,
-            tok_embedding,
-            ar_len,
-            max_seq_len,
-            k_caches,
-            v_caches,
-            total_token_list,
-            lookahead_config,
-        )
+        if blend_config is None:
+            _generate(
+                inputs,
+                cur_pos,
+                module,
+                tokenizer,
+                tok_embedding,
+                ar_len,
+                max_seq_len,
+                k_caches,
+                v_caches,
+                total_token_list,
+                lookahead_config
+            )
 
     logging.info(f"kv inference result:\n{tokenizer.decode(total_token_list)}")
     if collect_logits:
@@ -880,6 +995,7 @@ def graph_module_inference(
     event_name: Optional[str] = None,
     seq_mse_candidates: int = 0,
     lookahead_config: Optional[Tuple[int]] = None,
+    blend_config: Optional[Tuple[int]] = None,
 ):
     """
     This function supports model execution from static nn.Module decoder model
@@ -895,6 +1011,7 @@ def graph_module_inference(
         if use_kv_cache:
             kwargs["ar_len"] = ar_len
             kwargs["lookahead_config"] = lookahead_config
+            kwargs["blend_config"] = blend_config
 
         INFERENCE_REGISTRY[use_kv_cache](
             get_example_inputs,
@@ -920,6 +1037,7 @@ def graph_module_inference(
             get_example_inputs=get_example_inputs,
             use_i64_token=use_i64_token,
             seq_mse_candidates=seq_mse_candidates,
+            blend_config = blend_config
         )
         # Evaluate the model
         with torch.no_grad():
