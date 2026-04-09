@@ -160,6 +160,10 @@ from executorch.examples.qualcomm.oss_scripts.llama.model import (
 import scipy
 import math
 
+TEST_CPP = True
+if TEST_CPP:
+    import pylmstore
+
 kv_store = []
 reuse_thres = 6
 inter_compute_num = 8
@@ -276,39 +280,57 @@ def rerotate_kv(ori_pos, new_pos,
                 k_caches, v_caches,
                 matched_len, enable_r3=True,
                 partial_rotary_factor=1.0):
-    if partial_rotary_factor < 1:
-        apply_rope_emb = ROTARY_EMB_REGISTRY["partial"]
-    else:
-        apply_rope_emb = ROTARY_EMB_REGISTRY["default"]
-    # compute rerotation matrices
-    original_freqs_cos = freqs_cos.narrow(0, ori_pos, matched_len)
-    original_freqs_sin = freqs_sin.narrow(0, ori_pos, matched_len)
-    new_freqs_cos = freqs_cos.narrow(0, new_pos, matched_len)
-    new_freqs_sin = freqs_sin.narrow(0, new_pos, matched_len)
-    rerotation_cos = (
-        new_freqs_cos * original_freqs_cos + new_freqs_sin * original_freqs_sin
-    )
-    rerotation_sin = (
-        new_freqs_sin * original_freqs_cos - new_freqs_cos * original_freqs_sin
-    )
-    # rerotate kv, resolve spinquant
+    head_dim = k_caches[0].shape[2]
     rerotated_k = []
-    if enable_r3:
-        head_dim = k_caches[0].shape[2]
-        r3_weight = torch.tensor(
-            scipy.linalg.hadamard(head_dim, dtype=float)
-            / math.sqrt(head_dim),
-            dtype=torch.float32,
-            device="cpu",
+
+    if TEST_CPP:
+        apply_rope_emb = pylmstore.apply_rope_emb_cpp
+        rerotation_cos, rerotation_sin = pylmstore.compute_rerotation_cos_sin_cpp(freqs_cos, freqs_sin, ori_pos, new_pos, matched_len)
+    else:
+        if partial_rotary_factor < 1:
+            apply_rope_emb = ROTARY_EMB_REGISTRY["partial"]
+        else:
+            apply_rope_emb = ROTARY_EMB_REGISTRY["default"]
+        # compute rerotation matrices
+        original_freqs_cos = freqs_cos.narrow(0, ori_pos, matched_len)
+        original_freqs_sin = freqs_sin.narrow(0, ori_pos, matched_len)
+        new_freqs_cos = freqs_cos.narrow(0, new_pos, matched_len)
+        new_freqs_sin = freqs_sin.narrow(0, new_pos, matched_len)
+        rerotation_cos = (
+            new_freqs_cos * original_freqs_cos + new_freqs_sin * original_freqs_sin
         )
-    for k in k_caches:
-        k = k.transpose(2, 3)
+        rerotation_sin = (
+            new_freqs_sin * original_freqs_cos - new_freqs_cos * original_freqs_sin
+        )
+        # rerotate kv, resolve spinquant
         if enable_r3:
-            k = torch.matmul(k, r3_weight.T)
-        k = apply_rope_emb(k, rerotation_cos, rerotation_sin)
-        if enable_r3:
-            k = torch.matmul(k, r3_weight)
-        rerotated_k.append(k.transpose(2,3))
+            r3_weight = torch.tensor(
+                scipy.linalg.hadamard(head_dim, dtype=float)
+                / math.sqrt(head_dim),
+                dtype=torch.float32,
+                device="cpu",
+            )
+    for i, k in enumerate(k_caches):
+        if TEST_CPP:
+            k = k.contiguous()
+            # if enable_r3:
+            #     k = pylmstore.hadamard_cpp(k, dim=head_dim, 
+            #                                scale=1/math.sqrt(head_dim), transpose=True)
+            # k = apply_rope_emb(k, rerotation_cos, rerotation_sin)
+            # if enable_r3:
+            #     k = pylmstore.hadamard_cpp(k, dim=head_dim, 
+            #                                scale=1/math.sqrt(head_dim))
+            # rerotated_k.append(pylmstore.transpose_cpp(k))
+            rerotated_k.append(
+                pylmstore.rerotate_k_fp32_cpp(k, rerotation_cos, rerotation_sin, enable_r3)
+            )
+        else:
+            if enable_r3:
+                k = torch.matmul(k, r3_weight.T)
+            k = apply_rope_emb(k, rerotation_cos, rerotation_sin)
+            if enable_r3:
+                k = torch.matmul(k, r3_weight)
+            rerotated_k.append(k.transpose(2,3))
     rerotated_v = v_caches
     return rerotated_k, rerotated_v
 
