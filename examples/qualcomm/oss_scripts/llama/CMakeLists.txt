@@ -35,6 +35,8 @@ list(
   ${CMAKE_CURRENT_LIST_DIR}/runner/prompt_processor.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/token_generator.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/token_generator.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/blender.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/blender.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/imem_alloc.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/client_mem.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/lhd_token_generator.cpp
