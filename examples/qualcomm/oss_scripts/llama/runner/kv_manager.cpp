@@ -358,10 +358,6 @@ void KVManager<T>::update_key(
   if (selected.empty()) {
     for (int i = 0; i < n_iter; ++i) {
       std::memcpy(write_ptr, read_ptr, copy_size);
-      for (int j = 0; j < 32; ++j) {
-        ET_LOG(Info, "Updating k_cache[%d]: %d", j, (int)write_ptr[j]);
-      }
-      exit(1);
       write_ptr += iter_size;
       read_ptr += out_size;
     }
@@ -473,10 +469,8 @@ void KVManager<T>::blender_update_key(
   for (int i = 0; i < n_iter; ++i) {
     for (int j = 0; j < blend_len; ++j) {
       write_ptr[imp_indices[j]] = read_ptr[j];
-      ET_LOG(Info, "Scattering k_cache[%d]: %d", imp_indices[j], (int)write_ptr[imp_indices[j]]);
-      ET_LOG(Info, "read_ptr[%d]: %d", j, (int)read_ptr[j]);
+      ET_LOG(Info, "read_ptr[%d, %d]: %d", i, j, (int)read_ptr[j]);
     }
-    exit(1);
     write_ptr += iter_size;
     read_ptr += out_size;
   }

@@ -105,6 +105,7 @@ Runner<T>::Runner(
     const bool use_kv_store,
     const int test_level,
     const int blend_len,
+    torch::executor::EventTracer* event_tracer,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
     : module_(std::move(module)),
@@ -120,6 +121,7 @@ Runner<T>::Runner(
       temperature_(temperature),
       eval_mode_(static_cast<EvalMode>(eval_mode)),
       shared_buffer_(shared_buffer),
+      event_tracer_(event_tracer),
       tokenizer_(std::move(tokenizer)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)) {
   stats_.reset();
@@ -243,7 +245,8 @@ Error Runner<T>::load() {
   decoder_runner_ =
       std::make_unique<DecoderRunner>(module_.get(), vocab_size, temperature_);
 
-  ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
+  ET_CHECK_OK_OR_RETURN_ERROR(
+      decoder_runner_->load(method_names, event_tracer_));
 
   ET_LOG(Info, "Reading metadata from model");
   // retrieve any method meta, can be either prefill or kv
@@ -306,7 +309,7 @@ Error Runner<T>::load() {
     attention_sink_rope_runner_ = std::make_unique<AttentionSinkRopeRunner>(
         attention_sink_rope_module_.get());
     ET_CHECK_OK_OR_RETURN_ERROR(
-        attention_sink_rope_runner_->load(method_names));
+        attention_sink_rope_runner_->load(method_names, event_tracer_));
   }
 
   prompt_processor_ = std::make_unique<PromptProcessor<T>>(

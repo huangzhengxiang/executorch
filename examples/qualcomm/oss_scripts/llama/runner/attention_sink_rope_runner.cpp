@@ -33,12 +33,14 @@ Error AttentionSinkRopeRunner::set_outputs(
 }
 
 Error AttentionSinkRopeRunner::load(
-    const std::vector<std::string>& method_names) {
+    const std::vector<std::string>& method_names,
+    torch::executor::EventTracer* event_tracer) {
   if (is_method_loaded(method_names)) {
     return Error::Ok;
   }
   for (const std::string& method_name : method_names) {
-    ET_CHECK_OK_OR_RETURN_ERROR(module_->load_method(method_name));
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        module_->load_method(method_name, nullptr, event_tracer));
   }
   eviction_batch_size_ = ET_UNWRAP(module_->get("get_eviction_batch_size"))
                              .toScalar()

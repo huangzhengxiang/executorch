@@ -597,10 +597,9 @@ class LlamaAttention(nn.Module):
             imp_indices = torch.where(self.last_token_idx.unsqueeze(0).expand(batch_size, -1), 
                                       last_token_idx.reshape(-1, 1).expand(-1, self.blend_len),
                                       imp_indices)
-            k = torch.gather(k, dim=2, 
-                             index=imp_indices.unsqueeze(1).unsqueeze(3).expand(-1, self.n_kv_heads, -1, self.head_dim))
-            v = torch.gather(v, dim=2, 
-                             index=imp_indices.unsqueeze(1).unsqueeze(3).expand(-1, self.n_kv_heads, -1, self.head_dim))
+            kv_indices = imp_indices.unsqueeze(1).unsqueeze(3).expand(-1, self.n_kv_heads, -1, self.head_dim)
+            k = torch.gather(k, dim=2, index=kv_indices)
+            v = torch.gather(v, dim=2, index=kv_indices)
             q = torch.gather(q, dim=2, 
                              index=imp_indices.unsqueeze(1).unsqueeze(3).expand(-1, self.n_heads, -1, self.head_dim))
             atten_mask = torch.gather(atten_mask, dim=-2, 

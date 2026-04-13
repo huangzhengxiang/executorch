@@ -73,6 +73,8 @@ target_link_libraries(
   extension_llm_runner
   extension_module
   extension_tensor
+  etdump
+  flatccrt
   gflags
   custom_ops
   quantized_ops_lib

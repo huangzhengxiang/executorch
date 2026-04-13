@@ -12,6 +12,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor.h>
+#include <executorch/runtime/core/event_tracer.h>
 
 namespace example {
 class AttentionSinkRopeRunner {
@@ -40,7 +41,9 @@ class AttentionSinkRopeRunner {
    * Load the Module for attention sink purpose.
    * @return The error code.
    */
-  executorch::runtime::Error load(const std::vector<std::string>& method_names);
+  executorch::runtime::Error load(
+      const std::vector<std::string>& method_names,
+      torch::executor::EventTracer* event_tracer = nullptr);
   /**
    * Check if the required methods in the Module is loaded.
    * @return True if the Module is loaded, false otherwise.

@@ -135,6 +135,15 @@ def process_model_args(
     model_args.ar_len = ar_len
     model_args.kv_io_bit_width = quant_recipe.get_kv_io_bit_width()
 
+    if control_args.num_layers is not None:
+        if control_args.num_layers <= 0:
+            raise ValueError("--num_layers must be greater than 0")
+        if control_args.num_layers > model_args.n_layers:
+            raise ValueError(
+                f"--num_layers ({control_args.num_layers}) exceeds model depth ({model_args.n_layers})"
+            )
+        model_args.n_layers = control_args.num_layers
+
     model_args.blend_len = control_args.blend_len
     if mode == Mode.BLENDER and \
         (control_args.model_mode == "hybrid" or control_args.model_mode == "blender"):

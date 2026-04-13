@@ -27,6 +27,7 @@
 #include <executorch/extension/llm/runner/irunner.h>
 #include <executorch/extension/llm/runner/stats.h>
 #include <executorch/extension/module/module.h>
+#include <executorch/runtime/core/event_tracer.h>
 #include <pytorch/tokenizers/tokenizer.h>
 #include <NaiveKVStore.h>
 #include <SQLiteKVStore.h>
@@ -73,6 +74,7 @@ class Runner : public executorch::extension::llm::IRunner {
       const bool use_kv_store = false,
       const int test_level = 0,
       const int blend_len = 0,
+      torch::executor::EventTracer* event_tracer = nullptr,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
           attention_sink_rope_module = nullptr);
@@ -128,6 +130,7 @@ class Runner : public executorch::extension::llm::IRunner {
   float temperature_;
   EvalMode eval_mode_;
   bool shared_buffer_;
+  torch::executor::EventTracer* event_tracer_;
 
   DecoderModelVersion decoder_model_version_;
   std::unique_ptr<IMemAlloc> buffer_manager_;

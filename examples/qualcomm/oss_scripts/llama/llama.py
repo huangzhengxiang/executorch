@@ -162,6 +162,7 @@ def compile(
             backend_options=backend_options,
             shared_buffer=not args.enable_x86_64,
             use_mha2sha=True,
+            dump_intermediate_outputs=args.dump_intermediate_outputs,
         )
     ] * graph_num
 
@@ -429,6 +430,13 @@ def _build_parser():
         "--prefill_ar_len",
         help="The auto-regression (AR) length determines the number of tokens to consume and the number of logits to produce. Use this option to process the prompt and generate the key-value (kv) cache, which serves as a prompt processor for hybrid and lookahead mode.",
         default=32,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--num_layers",
+        help="Debug export only the first N decoder layers instead of the full network. Embedding, final norm, and lm head are preserved.",
+        default=None,
         type=int,
     )
 

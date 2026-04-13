@@ -7,6 +7,7 @@ import argparse
 import inspect
 import json
 import logging
+import os
 import types
 
 from functools import partial
@@ -214,6 +215,19 @@ class TextDecoder(Component):
                     partial_rotary_dim,
                 )
 
+        if self.control_args.num_layers is not None:
+            trimmed_state_dict = {}
+            for key, value in state_dict.items():
+                if not key.startswith("layers."):
+                    trimmed_state_dict[key] = value
+                    continue
+
+                parts = key.split(".")
+                layer_idx = int(parts[1])
+                if layer_idx < decoder.n_layers:
+                    trimmed_state_dict[key] = value
+            state_dict = trimmed_state_dict
+
         decoder.load_state_dict(state_dict, strict=True, assign=True)
 
         # apply spin quant if required
@@ -322,6 +336,11 @@ class TextDecoder(Component):
                 decoder.ar_len,
                 decoder.vocab_size,
             ),
+            (
+                decoder.max_batch_size,
+                decoder.blend_len,
+                decoder.vocab_size,
+            ),
         }
         # shape of k caches and v caches
         self.kv_cache_shape = {
@@ -331,6 +350,9 @@ class TextDecoder(Component):
             # single head, kv output
             (self.meta["get_head_dim"], self.meta["get_ar_len"]),
             (self.meta["get_ar_len"], self.meta["get_head_dim"]),
+            # single head, kv output
+            (self.meta["get_head_dim"], self.meta["get_blend_len"]),
+            (self.meta["get_blend_len"], self.meta["get_head_dim"]),
         }
         if decoder.use_blend:
             self.blend_config = {
@@ -680,6 +702,7 @@ class TextDecoder(Component):
                 for node in self.decoder.graph.nodes:
                     if node.op == "output":
                         for output in node.args[0]:
+                            print("determinine annotate_prefill_kv_output: ", output_indices, output.args[1:])
                             kv_quant_attrs[output_indices] = output.args[1:]
                             output_indices += 1
                         break

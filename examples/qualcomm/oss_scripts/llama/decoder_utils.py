@@ -74,6 +74,28 @@ def _modality_inputs_merger(
     return inputs_embeds
 
 
+def _normalize_decoder_outputs(results, use_blend: bool = False):
+    if not isinstance(results, tuple):
+        results = (results,)
+
+    if use_blend:
+        if len(results) < 4:
+            raise ValueError(
+                f"Expected at least 4 decoder outputs for blend mode, got {len(results)}"
+            )
+        (logits, new_k_caches, new_v_caches), imp_indices = results[:3], results[-1]
+        extra_outputs = results[3:-1]
+        return logits, new_k_caches, new_v_caches, imp_indices, extra_outputs
+
+    if len(results) < 3:
+        raise ValueError(
+            f"Expected at least 3 decoder outputs for kv mode, got {len(results)}"
+        )
+    logits, new_k_caches, new_v_caches = results[:3]
+    extra_outputs = results[3:]
+    return logits, new_k_caches, new_v_caches, extra_outputs
+
+
 @dataclass
 class DecoderInputs:
     all_pos: torch.Tensor
@@ -497,11 +519,15 @@ def _prefill_chunking(
                         valid_mask
                     )                
             if blend_config is None:
-                logits, new_k_caches, new_v_caches = results
+                logits, new_k_caches, new_v_caches, _ = _normalize_decoder_outputs(
+                    results, use_blend=False
+                )
                 if collect_logits:
                     result_logits.append(logits[:, :num_tokens_in_chunk])
             else:
-                logits, new_k_caches, new_v_caches, imp_indices = results
+                logits, new_k_caches, new_v_caches, imp_indices, _ = (
+                    _normalize_decoder_outputs(results, use_blend=True)
+                )
                 if collect_logits:
                     result_logits.append(logits[:, :])
                 for layer in range(len(k_caches)):
@@ -617,20 +643,26 @@ def _generate(
             ]
 
             if inputs.input_ids is not None:
-                logits, new_k_caches, new_v_caches = module(
-                    tmp_token_list,
-                    *inputs.atten_mask,
-                    tmp_pos,
-                    *k_caches,
-                    *v_caches,
+                logits, new_k_caches, new_v_caches, _ = _normalize_decoder_outputs(
+                    module(
+                        tmp_token_list,
+                        *inputs.atten_mask,
+                        tmp_pos,
+                        *k_caches,
+                        *v_caches,
+                    ),
+                    use_blend=False,
                 )
             else:
-                logits, new_k_caches, new_v_caches = module(
-                    embedding,
-                    *inputs.atten_mask,
-                    tmp_pos,
-                    *k_caches,
-                    *v_caches,
+                logits, new_k_caches, new_v_caches, _ = _normalize_decoder_outputs(
+                    module(
+                        embedding,
+                        *inputs.atten_mask,
+                        tmp_pos,
+                        *k_caches,
+                        *v_caches,
+                    ),
+                    use_blend=False,
                 )
 
             pos, k_caches, v_caches = smart_mask_updater(
@@ -677,26 +709,32 @@ def _generate(
             )
             # inference
             if inputs.input_ids is not None:
-                logits, new_k_caches, new_v_caches = module(
-                    torch.tensor(input_tokens, dtype=inputs.input_ids_dtype).unsqueeze(
-                        0
-                    ),
-                    *inputs.atten_mask,
-                    pos_offsets + pos,
-                    *k_caches,
-                    *v_caches,
-                )
-            else:
-                logits, new_k_caches, new_v_caches = module(
-                    text_embedding(
+                logits, new_k_caches, new_v_caches, _ = _normalize_decoder_outputs(
+                    module(
                         torch.tensor(
                             input_tokens, dtype=inputs.input_ids_dtype
-                        ).unsqueeze(0)
+                        ).unsqueeze(0),
+                        *inputs.atten_mask,
+                        pos_offsets + pos,
+                        *k_caches,
+                        *v_caches,
                     ),
-                    *inputs.atten_mask,
-                    pos_offsets + pos,
-                    *k_caches,
-                    *v_caches,
+                    use_blend=False,
+                )
+            else:
+                logits, new_k_caches, new_v_caches, _ = _normalize_decoder_outputs(
+                    module(
+                        text_embedding(
+                            torch.tensor(
+                                input_tokens, dtype=inputs.input_ids_dtype
+                            ).unsqueeze(0)
+                        ),
+                        *inputs.atten_mask,
+                        pos_offsets + pos,
+                        *k_caches,
+                        *v_caches,
+                    ),
+                    use_blend=False,
                 )
             # collect outputs
             output_tokens = torch.argmax(logits, dim=-1).flatten().tolist()

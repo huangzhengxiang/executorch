@@ -214,7 +214,9 @@ void BlenderPromptProcessor<T>::init_io(
   }
 
   // [O]: imp_indices
-  Result<TensorInfo> imp_indices = method_meta->output_tensor_meta(1 + 2 * metadata_.num_layers);
+  index = 1 + 2 * metadata_.num_layers;
+  Result<TensorInfo> imp_indices = method_meta->output_tensor_meta(index++);
+  ET_LOG(Info, "imp_indices size: %d %d %d", imp_indices->sizes()[0], imp_indices->sizes()[1], imp_indices->sizes()[2]);
   imp_indices_.data =
       reinterpret_cast<int32_t*>(buffer_manager->allocate(imp_indices_.size));
   imp_indices_.tensor = std::make_unique<TensorImpl>(

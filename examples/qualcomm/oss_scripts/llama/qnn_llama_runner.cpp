@@ -16,6 +16,7 @@
  */
 
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
+#include <executorch/devtools/etdump/etdump_flatcc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
 #include <executorch/extension/llm/runner/irunner.h>
 #include <executorch/runtime/platform/log.h>
@@ -40,6 +41,22 @@ DEFINE_string(
     performance_output_path,
     "inference_speed.txt",
     "Records inference speed. For CI purpose.");
+DEFINE_string(
+    etdump_path,
+    "etdump.etdp",
+    "If intermediate dump is enabled, etdump will be written to this path.");
+DEFINE_bool(
+    dump_intermediate_outputs,
+    false,
+    "Dump intermediate outputs to etdump/debug buffer files.");
+DEFINE_string(
+    debug_output_path,
+    "debug_output.bin",
+    "Path to dump debug outputs to.");
+DEFINE_int32(
+    debug_buffer_size,
+    100000000,
+    "Size of the debug buffer in bytes to allocate for intermediate outputs and program outputs logging.");
 DEFINE_string(
     dump_logits_path,
     "",
@@ -68,7 +85,7 @@ DEFINE_int32(
 DEFINE_int32(
     eval_mode,
     1,
-    "0: TokenGenerator(kv) / 1: HybridMode (prefill+kv) / 2: Lookahead Decoding");
+    "0: TokenGenerator(kv) / 1: HybridMode (prefill+kv) / 2: Lookahead Decoding / 3: BlenderMode");
 DEFINE_bool(
     shared_buffer,
     false,
@@ -94,6 +111,10 @@ DEFINE_int32(
     test_level,
     false,
     "determine the debug test level.");
+DEFINE_int32(
+    blend_len,
+    32,
+    "Blend Length for BlenderMode");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -223,6 +244,17 @@ void start_runner(
     std::unique_ptr<executorch::extension::Module> module,
     std::vector<std::string>& prompts,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
+  executorch::etdump::ETDumpGen etdump_gen;
+  void* debug_buffer = nullptr;
+  if (FLAGS_dump_intermediate_outputs) {
+    debug_buffer = malloc(FLAGS_debug_buffer_size);
+    ET_CHECK_MSG(debug_buffer != nullptr, "Failed to allocate debug buffer");
+    executorch::runtime::Span<uint8_t> buffer(
+        static_cast<uint8_t*>(debug_buffer), FLAGS_debug_buffer_size);
+    etdump_gen.set_debug_buffer(buffer);
+    etdump_gen.set_event_tracer_debug_level(
+        executorch::runtime::EventTracerDebugLogLevel::kNoLogging);
+  }
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -242,6 +274,8 @@ void start_runner(
       FLAGS_gcap,
       FLAGS_kv_store,
       FLAGS_test_level,
+      FLAGS_blend_len,
+      FLAGS_dump_intermediate_outputs ? &etdump_gen : nullptr,
       nullptr,
       std::move(attention_sink_rope_module));
   auto decoder_model_version = runner.get_decoder_model_version();
@@ -280,6 +314,31 @@ void start_runner(
 
   fout.write(buf.data(), buf.size());
   fout.close();
+
+  if (FLAGS_dump_intermediate_outputs) {
+    executorch::etdump::ETDumpResult result = etdump_gen.get_etdump_data();
+    ET_LOG(
+        Info,
+        "Write etdump to %s, Size = %zu",
+        FLAGS_etdump_path.c_str(),
+        result.size);
+    FILE* etdump_file = fopen(FLAGS_etdump_path.c_str(), "w+");
+    ET_CHECK_MSG(etdump_file != nullptr, "Failed to open etdump output file");
+    fwrite((uint8_t*)result.buf, 1, result.size, etdump_file);
+    fclose(etdump_file);
+    free(result.buf);
+
+    ET_LOG(
+        Info,
+        "Write debug output binary to %s, Size = %zu",
+        FLAGS_debug_output_path.c_str(),
+        (size_t)FLAGS_debug_buffer_size);
+    FILE* debug_file = fopen(FLAGS_debug_output_path.c_str(), "w+");
+    ET_CHECK_MSG(debug_file != nullptr, "Failed to open debug output file");
+    fwrite((uint8_t*)debug_buffer, 1, FLAGS_debug_buffer_size, debug_file);
+    fclose(debug_file);
+    free(debug_buffer);
+  }
 }
 
 int main(int argc, char** argv) {

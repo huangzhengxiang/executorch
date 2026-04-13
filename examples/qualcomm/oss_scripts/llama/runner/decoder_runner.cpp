@@ -42,12 +42,15 @@ Error DecoderRunner::set_outputs(
   return Error::Ok;
 }
 
-Error DecoderRunner::load(const std::vector<std::string>& method_names) {
+Error DecoderRunner::load(
+    const std::vector<std::string>& method_names,
+    torch::executor::EventTracer* event_tracer) {
   if (is_method_loaded(method_names)) {
     return Error::Ok;
   }
   for (const std::string& method_name : method_names) {
-    ET_CHECK_OK_OR_RETURN_ERROR(module_->load_method(method_name));
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        module_->load_method(method_name, nullptr, event_tracer));
   }
   return Error::Ok;
 }

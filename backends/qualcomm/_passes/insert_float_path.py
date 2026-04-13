@@ -117,6 +117,7 @@ class InsertFloatPath(ExportPass):
             for user in users:
                 if (user.meta.get(QCOM_QUANT_ATTRS) is None 
                     and user.op != "output"
+                    and user.target not in self.q_dq_map.values()
                     and _is_float_tensor(user)
                     ):
                     user.replace_input_with(node, inserted_node)
@@ -148,6 +149,7 @@ class InsertFloatPath(ExportPass):
                 and any(
                     (user.meta.get(QCOM_QUANT_ATTRS) is None 
                      and user.op != "output"
+                     and user.target not in self.q_dq_map.values()
                      and _is_float_tensor(user)) 
                     for user in users
                 )
