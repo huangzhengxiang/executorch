@@ -394,6 +394,12 @@ Result<uint64_t> BlenderPromptProcessor<T>::prefill(
     //       logits_.data + metadata_.ar_len * metadata_.vocab_size);
     // }
 
+    // Match prompt_processor behavior for the tail chunk: only the meaningful
+    // prompt tokens should advance cache/mask state.
+    if (i == num_iters - 1) {
+      n_update = 1 + ((num_prompt_tokens - 1) % metadata_.ar_len);
+    }
+
     // Update KV Cache with the output results
     // kv_manager_->update_cache(metadata_.ar_len, shifted_pos, n_update, {});
     kv_manager_->blender_update_cache(metadata_.ar_len, 
