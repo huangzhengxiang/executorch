@@ -144,6 +144,10 @@ class ModelArgs:
     final_logit_softcapping: Optional[float] = None
     attn_logit_softcapping: Optional[float] = None
 
+    # mobile blend
+    use_blend: bool = False
+    blend_len: int = 32
+
     def __post_init__(self):
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
