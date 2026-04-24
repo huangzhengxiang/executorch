@@ -117,6 +117,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
             SentencePieceTokenizer, TiktokenTokenizer, HuggingFaceTokenizer
         ],
         max_seq_length: int,
+        max_ar_len: int,
         ar_len: int,
         use_kv_cache: bool,
         get_example_inputs: Callable,
@@ -127,7 +128,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         # n seq len = n-1 cache len, so we len(inps) = n-1 during _model_call
         assert max_seq_length is not None, "max_seq_length must be provided"
         super().__init__(
-            model=model, tokenizer=tokenizer, max_seq_length=max_seq_length - 1
+            model=model, tokenizer=tokenizer, max_seq_length=max_seq_length - max_ar_len - 1
         )
         self._model = model.to(self.device)
         self.ar_len = ar_len
@@ -438,6 +439,8 @@ def _prefill_chunking(
         num_prompt_tokens = len(total_token_list)
         print("prefill total token len: ", num_prompt_tokens)
         pos = 0  # Tracks how many prompt tokens have been processed.
+        # using sliding window blender prefill.
+        blender_process_len = blend_config["blend_len"]-1 if blend_config is not None else 0
         while pos < num_prompt_tokens:
             chunk_start_idx, chunk_end_idx = pos, min(num_prompt_tokens, pos + ar_len)
 
@@ -469,7 +472,7 @@ def _prefill_chunking(
             ]
 
             valid_mask = torch.zeros((1, ar_len), dtype=torch.int32)
-            valid_mask[:] = (torch.arange(ar_len) < num_tokens_in_chunk)
+            valid_mask[:] = (torch.arange(ar_len) < min(blender_process_len, num_tokens_in_chunk))
 
             if blend_config is not None:
                 precomputed_start = chunk_start_idx
@@ -529,7 +532,11 @@ def _prefill_chunking(
                     _normalize_decoder_outputs(results, use_blend=True)
                 )
                 if collect_logits:
-                    result_logits.append(logits[:, :])
+                    logits_shape = list(logits.shape)
+                    logits_shape[1] = min(blender_process_len, num_tokens_in_chunk)
+                    result_logits.append(torch.zeros(logits_shape).scatter(
+                        src=logits[:, :min(blender_process_len, num_tokens_in_chunk)],
+                        dim=1, index=imp_indices[:, :min(blender_process_len, num_tokens_in_chunk)].unsqueeze(-1).repeat(1,1,logits.shape[-1])))
                 for layer in range(len(k_caches)):
                     # update HKVD only
                     k_caches[layer][:,:,:,chunk_start_idx:chunk_start_idx+ar_len] = k_caches[layer][:,:,:,-ar_len:]
@@ -565,7 +572,8 @@ def _prefill_chunking(
 
             # Update the pos, KV cache and attention mask.
             pos, k_caches, v_caches = smart_mask_updater(
-                num_tokens_in_chunk,
+                min(num_tokens_in_chunk, blender_process_len) \
+                    if blend_config is not None else num_tokens_in_chunk,
                 inputs.atten_mask,
                 pos,
                 k_caches,
@@ -575,20 +583,20 @@ def _prefill_chunking(
             )
 
         # save for blender
-        if (ar_len > 1):
-            if blend_config is None:
-                debug_fd = open("debug.pickle", "ab")
-            else:
-                debug_fd = open("debug_blend.pickle", "ab")
-            pickle.dump({
-                "tokens": total_token_list,
-                "ori_pos": 0,
-                "k_caches": [torch.cat([k, new_k], dim=-1)[:,:,:,:len(total_token_list)] 
-                             for k, new_k in zip(k_caches, new_k_caches)],
-                "v_caches": [torch.cat([v, new_v], dim=2)[:,:,:len(total_token_list),:] 
-                             for v, new_v in zip(v_caches, new_v_caches)]
-            }, debug_fd)
-            debug_fd.close()            
+        # if (ar_len > 1):
+        if blend_config is None:
+            debug_fd = open("debug.pickle", "ab")
+        else:
+            debug_fd = open("debug_blend.pickle", "ab")
+        pickle.dump({
+            "tokens": total_token_list,
+            "ori_pos": 0,
+            "k_caches": [torch.cat([k, new_k], dim=-1)[:,:,:,:len(total_token_list)] 
+                            for k, new_k in zip(k_caches, new_k_caches)],
+            "v_caches": [torch.cat([v, new_v], dim=2)[:,:,:len(total_token_list),:] 
+                            for v, new_v in zip(v_caches, new_v_caches)]
+        }, debug_fd)
+        debug_fd.close()            
 
         # Append the last run logits to the total_token_list.
         total_token_list.append(
@@ -834,6 +842,7 @@ def kv_inference(  # noqa: C901
             raise RuntimeError("Unknown tokenizer")
     else:
         # pyre-ignore
+        print(f"prompt token len: {len(prompt_token_list)}")
         prompt_token_list = prompt.flatten().tolist()
 
     # 2. forward text embedding
@@ -913,7 +922,8 @@ def kv_inference(  # noqa: C901
 
         # Phase 2: Generate tokens until the EOS token is generated or max_seq_len is reached.
         # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
-        if blend_config is None:
+        if False:
+        # if blend_config is None and not collect_logits:
             _generate(
                 inputs,
                 cur_pos,
@@ -931,6 +941,8 @@ def kv_inference(  # noqa: C901
     logging.info(f"kv inference result:\n{tokenizer.decode(total_token_list)}")
     if collect_logits:
         result_logits = torch.cat(result_logits, dim=1)
+        torch.save(result_logits, f"result_logits_{'blender' if blend_config is not None else 'default'}.pt")
+        print(result_logits.shape)
     return result_logits
 
 
@@ -1020,6 +1032,7 @@ def graph_module_inference(
     get_example_inputs: Callable,
     module: torch.fx.GraphModule,
     tokenizer,
+    max_ar_len=128,
     ar_len=1,
     max_seq_len=512,
     prompt=None,
@@ -1070,6 +1083,7 @@ def graph_module_inference(
             model=module,
             tokenizer=tokenizer,
             max_seq_length=max_seq_len,
+            max_ar_len=max_ar_len,
             ar_len=ar_len,
             use_kv_cache=use_kv_cache,
             get_example_inputs=get_example_inputs,
