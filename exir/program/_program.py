@@ -1396,6 +1396,13 @@ def to_edge_transform_and_lower(  # noqa: C901
                 method_to_partitioner[name] = partitioner_list[i]
         edge_manager = edge_manager.to_backend(method_to_partitioner)
 
+    for graph_name in edge_manager._edge_programs: 
+        print(f"\n===== [{graph_name}] exported IO Info =====\n")
+        for n in edge_manager._edge_programs[graph_name].graph.nodes:
+            print(n.op, n.name, n.target, n.args)
+            print("  dtype:", n.meta.get("val", None))
+            print("  quant attr:", n.meta.get("quant_attrs", None))
+
     for name, program in edge_manager._edge_programs.items():
         ops_set_to_not_decompose: Set[torch._ops.OpOverload] = set()
         partitioners = partitioner.get(name, [])

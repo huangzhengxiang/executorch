@@ -146,8 +146,9 @@ def annotate_blend(  # noqa: C901
     gm: torch.fx.GraphModule,
     is_qat=False,
 ) -> None:
-    print("annotating blender")
+    print("annotating blender: currently only support kv uint8.")
     def annotate_topk(node):
+        # TODO: currently only support kv uint8.
         if is_qat:
             quantization_config_8a8w = get_8a8w_qnn_qat_config(
                 act_symmetric=True, act_observer=MinMaxObserver
