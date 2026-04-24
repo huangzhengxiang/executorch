@@ -15,12 +15,14 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/attention_sink_rope_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/cache_utils.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/separate_embed.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/blender.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
@@ -74,6 +76,8 @@ class Runner : public executorch::extension::llm::IRunner {
       const bool use_kv_store = false,
       const int test_level = 0,
       const int blend_len = 0,
+      const bool separate_embed = false,
+      const std::string& embedding_matrix_path = "",
       torch::executor::EventTracer* event_tracer = nullptr,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
@@ -100,6 +104,14 @@ class Runner : public executorch::extension::llm::IRunner {
   executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version();
 
  private:
+  struct KvQuantAttr {
+    float scale;
+    int32_t zero_point;
+    int32_t quant_min;
+    int32_t quant_max;
+    std::string dtype;
+  };
+
   enum EvalMode {
     kKVCached = 0,
     kHybrid,
@@ -118,6 +130,8 @@ class Runner : public executorch::extension::llm::IRunner {
   int use_kv_store_{false};
   int test_level_{0};
   int blend_len_{0};
+  bool separate_embed_{false};
+  std::string embedding_matrix_path_;
 
   // Defaults to StaticCahce, indicating that the model does not use a
   // global/local architecture.
@@ -143,6 +157,9 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<BlenderPromptProcessor<T>> blender_prompt_processor_;
   std::unique_ptr<PromptProcessor<T>> prompt_processor_;
   std::unique_ptr<TokenGenerator<T>> token_generator_;
+  std::vector<KvQuantAttr> kv_output_quant_attrs_;
+  SeparateEmbedding separate_embedding_;
+  void load_kv_quant_attrs();
 
   // stats
   executorch::llm::Stats stats_;

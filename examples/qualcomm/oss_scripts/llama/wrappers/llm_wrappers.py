@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import struct
 import types
 
 from functools import partial
@@ -53,6 +54,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     DECODE_QDQ_FILENAME,
     BLENDER_DECODER_GRAPH_NAMES,
     DECODER_GRAPH_NAMES,
+    SEPARATE_EMBED_INFO_FILENAME,
+    SEPARATE_EMBED_MATRIX_FILENAME,
     TEXT_DECODER,
     TEXT_EMBEDDING,
     TEXT_EMBEDDING_GRAPH_NAMES,
@@ -94,7 +97,7 @@ from torchao.prototype.spinquant import apply_spinquant
 from torchao.quantization.pt2e import MinMaxObserver
 from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 from transformers import AutoModel
-
+from executorch.examples.qualcomm.oss_scripts.llama.wrappers.debugging import _store_graph_quant_attrs, get_graph_name
 
 class TextDecoder(Component):
 
@@ -526,7 +529,7 @@ class TextDecoder(Component):
         # Task-based calibration: Only for text-only LLMs
         # Multimodal models (VLMs) cannot use task-based evaluation currently.
         # BLENDER do not need task-based evaluation.
-        if has_task_calibration and not is_multimodal and self.mode != Mode.BLENDER:
+        if has_task_calibration and not is_multimodal:
             graph_module_inference(
                 use_kv_cache=self.meta["get_use_kv_cache"],
                 get_example_inputs=self.get_example_inputs,
@@ -660,6 +663,7 @@ class TextDecoder(Component):
                 print("  op:", node.op)
                 print("  args:", node.args)
                 print("  target:", node.target)
+                print("  ")
                 # print("  meta:", node.meta)
                 print("\n\n\n")
 
@@ -674,6 +678,39 @@ class TextDecoder(Component):
 
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
+            
+            # store quant info for debug purpose only
+            # _store_graph_quant_attrs(self.decoder, get_graph_name(self.mode), os.path.join(self.control_args.artifact, "quant_attrs"))
+            if False:
+                if self.mode == Mode.DECODE:
+                    import pickle
+                    decode_quant_attrs = []
+                    for node in self.decoder.graph.nodes:
+                        if (node.target == torch.ops.quantized_decomposed.quantize_per_tensor.default):
+                            decode_quant_attrs.append([node.args[0].name] + list(node.args[1:-1]))
+                    pickle.dump(decode_quant_attrs, open(os.path.join(self.control_args.artifact, "decode_quant_attrs.pkl"), "wb"))
+                if self.mode == Mode.BLENDER:
+                    import pickle
+                    blender_quant_attrs = []
+                    decode_quant_attrs = pickle.load(open(os.path.join(self.control_args.artifact, "decode_quant_attrs.pkl"), "rb"))
+                    scales = torch.tensor([qarg[1] for qarg in decode_quant_attrs])
+                    zp = torch.tensor([qarg[2] for qarg in decode_quant_attrs])
+                    for node in self.decoder.graph.nodes:
+                        if (node.target == torch.ops.quantized_decomposed.quantize_per_tensor.default):
+                            blender_quant_attrs.append([node.args[0].name] + list(node.args[1:-1]))
+                            match_score = torch.min(torch.abs(scales-node.args[1])/scales+torch.abs(zp-node.args[2])/zp)
+                            match_item = torch.argmin(torch.abs(scales-node.args[1])/scales+torch.abs(zp-node.args[2])/zp)
+                            print(f"blender_debug: {node.args[0:3]}, decode matched: {decode_quant_attrs[match_item][0:3]}, match score: {match_score}")
+
+            if self.mode == Mode.PREFILL or self.mode == Mode.BLENDER:
+                self._calibrate(
+                    model=self.decoder,
+                    tokenizer=data.tokenizer,
+                    event="convert_pt2e",
+                    user_calibration_data=data.calibration_data.datasets,
+                    tok_embedding=self.tok_embedding,
+                    intermediate_outputs=image_embedding,
+                )
 
             if self.control_args.verbose:
                 if self.apply_embedding:
@@ -764,12 +801,388 @@ class HybridTextDecoder(Component):
                 apply_embedding=apply_embedding,
             )
             self.set_next(self.decode).set_next(self.prefill).set_next(self.blender)
-            # self.set_next(self.blender) # debug
-            # self.set_next(self.decode).set_next(self.prefill) # debug
         else:
             self.set_next(self.decode).set_next(self.prefill)
 
         self.apply_embedding = apply_embedding
+
+    def _depends_on_node(self, node, source_node, memo):
+        if node == source_node:
+            return True
+        if node in memo:
+            return memo[node]
+        depends = False
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                if self._depends_on_node(arg, source_node, memo):
+                    depends = True
+                    break
+            elif isinstance(arg, (tuple, list)):
+                for item in arg:
+                    if (
+                        isinstance(item, torch.fx.Node)
+                        and self._depends_on_node(item, source_node, memo)
+                    ):
+                        depends = True
+                        break
+                if depends:
+                    break
+        memo[node] = depends
+        return depends
+
+    def _extract_embedding_boundary(self, graph, tokens_node):
+        memo = {}
+        for node in graph.nodes:
+            if node.op == "placeholder":
+                continue
+            if not self._depends_on_node(node, tokens_node, memo):
+                continue
+            val = node.meta.get("val", None)
+            if val is None:
+                continue
+            node_dim = getattr(val, "dim", None)
+            if callable(node_dim):
+                if node_dim() == 3:
+                    return node
+            elif hasattr(val, "shape") and len(val.shape) == 3:
+                return node
+        raise RuntimeError(
+            "Failed to identify token-embedding boundary node for separate embedding flow."
+        )
+
+    def _find_tokens_placeholder(self, graph, graph_name):
+        for node in graph.nodes:
+            if node.op == "placeholder" and "token" in node.name:
+                return node
+        raise RuntimeError(
+            f"Unable to find token placeholder in graph {graph_name} for separate embedding flow."
+        )
+
+    def _find_embedding_node(self, graph, tokens_node, graph_name):
+        memo = {}
+        for node in graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.aten.embedding.default
+                and self._depends_on_node(node, tokens_node, memo)
+            ):
+                return node
+        raise RuntimeError(
+            f"Unable to find embedding node in graph {graph_name} for separate embedding flow."
+        )
+
+    def _resolve_node_to_tensor(self, graph_module, value, preferred_dtype=None):
+        if isinstance(value, torch.fx.Node):
+            if value.op == "get_attr":
+                value = getattr(graph_module, value.target)
+            else:
+                raise RuntimeError(
+                    f"Expected get_attr node for tensor constant, got {value.op}:{value.target}"
+                )
+
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().contiguous()
+        if isinstance(value, bool):
+            return torch.tensor([int(value)], dtype=preferred_dtype or torch.int32)
+        if isinstance(value, int):
+            return torch.tensor([value], dtype=preferred_dtype or torch.int32)
+        if isinstance(value, float):
+            return torch.tensor([value], dtype=preferred_dtype or torch.float32)
+        if isinstance(value, (list, tuple)):
+            if preferred_dtype is not None:
+                return torch.tensor(value, dtype=preferred_dtype)
+            return torch.tensor(value)
+
+        raise RuntimeError(f"Unsupported constant type for embedding payload: {type(value)}")
+
+    def _torch_dtype_code(self, dtype):
+        dtype_codes = {
+            torch.float32: 1,
+            torch.float16: 2,
+            torch.int8: 3,
+            torch.uint8: 4,
+            torch.int16: 5,
+            torch.uint16: 6,
+            torch.int32: 7,
+            torch.int64: 8,
+            "int4": 9,
+        }
+        if dtype not in dtype_codes:
+            raise RuntimeError(f"Unsupported dtype for separate embedding payload: {dtype}")
+        return dtype_codes[dtype]
+
+    def _resolve_node_to_scalar(self, graph_module, value):
+        if isinstance(value, torch.fx.Node):
+            if value.op != "get_attr":
+                raise RuntimeError(
+                    f"Expected get_attr node for scalar constant, got {value.op}:{value.target}"
+                )
+            value = getattr(graph_module, value.target)
+
+        if isinstance(value, torch.Tensor):
+            tensor_value = value.detach().cpu()
+            if tensor_value.numel() != 1:
+                raise RuntimeError(
+                    f"Expected scalar tensor for quant range, got shape {list(tensor_value.shape)}"
+                )
+            value = tensor_value.item()
+
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        raise RuntimeError(f"Unsupported scalar constant type: {type(value)}")
+
+    def _get_quant_min_max(self, graph_module, dequant_node):
+        if dequant_node.target == torch.ops.quantized_decomposed.dequantize_per_tensor.default:
+            qmin_idx, qmax_idx = 3, 4
+        elif dequant_node.target == torch.ops.quantized_decomposed.dequantize_per_channel.default:
+            qmin_idx, qmax_idx = 5, 6
+        elif dequant_node.target == torch.ops.torchao.dequantize_affine:
+            qmin_idx, qmax_idx = 5, 6
+        else:
+            raise RuntimeError(f"Unsupported dequant op for quant range: {dequant_node.target}")
+
+        if len(dequant_node.args) > max(qmin_idx, qmax_idx):
+            quant_min = int(
+                self._resolve_node_to_scalar(graph_module, dequant_node.args[qmin_idx])
+            )
+            quant_max = int(
+                self._resolve_node_to_scalar(graph_module, dequant_node.args[qmax_idx])
+            )
+            return quant_min, quant_max
+
+        if "quant_min" in dequant_node.kwargs and "quant_max" in dequant_node.kwargs:
+            quant_min = int(
+                self._resolve_node_to_scalar(graph_module, dequant_node.kwargs["quant_min"])
+            )
+            quant_max = int(
+                self._resolve_node_to_scalar(graph_module, dequant_node.kwargs["quant_max"])
+            )
+            return quant_min, quant_max
+
+        raise RuntimeError(
+            f"Cannot read quant_min/quant_max from dequant node {dequant_node.target}."
+        )
+
+    def _storage_spec_from_quant_range(self, quant_min, quant_max):
+        key = (int(quant_min), int(quant_max))
+        if key == (0, 65535):
+            return {"storage_type": "uint16", "bit_width": 16}
+        if key == (-32767, 32767):
+            return {"storage_type": "int16", "bit_width": 16}
+        if key == (0, 255):
+            return {"storage_type": "uint8", "bit_width": 8}
+        if key == (-127, 127):
+            return {"storage_type": "int8", "bit_width": 8}
+        if key == (-7, 7):
+            return {"storage_type": "int4", "bit_width": 4}
+        raise RuntimeError(
+            f"Unsupported embedding quant range ({quant_min}, {quant_max}) for separate embedding export."
+        )
+
+    def _pack_int4(self, tensor):
+        flat = tensor.detach().cpu().contiguous().reshape(-1).to(torch.int32)
+        if flat.numel() == 0:
+            return b""
+        if torch.any(flat < -8) or torch.any(flat > 7):
+            raise RuntimeError(
+                f"int4 packing received out-of-range values [{flat.min().item()}, {flat.max().item()}]."
+            )
+        lo = torch.bitwise_and(flat[0::2], 0xF).to(torch.uint8)
+        hi_src = flat[1::2]
+        if hi_src.numel() < lo.numel():
+            hi_src = torch.cat((hi_src, torch.zeros(1, dtype=flat.dtype)))
+        hi = torch.bitwise_left_shift(torch.bitwise_and(hi_src, 0xF), 4).to(torch.uint8)
+        packed = torch.bitwise_or(lo, hi)
+        return packed.numpy().tobytes(order="C")
+
+    def _extract_embedding_payload(self, decoder_graph_module, graph_name):
+        graph = decoder_graph_module.graph
+        tokens_node = self._find_tokens_placeholder(graph, graph_name)
+        embedding_node = self._find_embedding_node(graph, tokens_node, graph_name)
+        weight_arg = embedding_node.args[0]
+
+        dequant_ops = {
+            torch.ops.quantized_decomposed.dequantize_per_tensor.default,
+            torch.ops.quantized_decomposed.dequantize_per_channel.default,
+            torch.ops.torchao.dequantize_affine,
+        }
+
+        if isinstance(weight_arg, torch.fx.Node) and weight_arg.target in dequant_ops:
+            qweight = self._resolve_node_to_tensor(decoder_graph_module, weight_arg.args[0])
+            scale_index, zp_index = 1, 2
+            if weight_arg.target == torch.ops.torchao.dequantize_affine:
+                scale_index, zp_index = 2, 3
+            quant_min, quant_max = self._get_quant_min_max(
+                decoder_graph_module, weight_arg
+            )
+            qweight_storage = self._storage_spec_from_quant_range(quant_min, quant_max)
+            scale = self._resolve_node_to_tensor(
+                decoder_graph_module,
+                weight_arg.args[scale_index],
+                preferred_dtype=torch.float32,
+            )
+            zp = self._resolve_node_to_tensor(
+                decoder_graph_module,
+                weight_arg.args[zp_index],
+                preferred_dtype=torch.int32,
+            )
+            if qweight.dim() != 2:
+                raise RuntimeError(
+                    f"Expected 2D qweight matrix in graph {graph_name}, got shape {list(qweight.shape)}"
+                )
+            return {
+                "quantized": True,
+                "qweight": qweight,
+                "scale": scale,
+                "zp": zp,
+                "quant_scheme": str(weight_arg.target),
+                "quant_min": quant_min,
+                "quant_max": quant_max,
+                "qweight_storage": qweight_storage,
+            }
+
+        weight = self._resolve_node_to_tensor(decoder_graph_module, weight_arg)
+        if weight.dim() != 2:
+            raise RuntimeError(
+                f"Expected 2D embedding weight matrix in graph {graph_name}, got shape {list(weight.shape)}"
+            )
+        return {
+            "quantized": False,
+            "weight": weight,
+        }
+
+    def _write_tensor_block(self, output_file, tensor, storage_spec=None):
+        if tensor is None:
+            output_file.write(struct.pack("<IIQ", 0, 0, 0))
+            return {"dtype": None, "shape": []}
+
+        payload_tensor = tensor.detach().cpu().contiguous()
+        if payload_tensor.dtype == torch.bfloat16:
+            payload_tensor = payload_tensor.to(torch.float32)
+        shape = list(payload_tensor.shape)
+        if storage_spec is not None:
+            storage_type = storage_spec["storage_type"]
+            if storage_type == "int4":
+                dtype_code = self._torch_dtype_code("int4")
+                raw = self._pack_int4(payload_tensor)
+                dtype_name = "int4_packed"
+            else:
+                storage_type_to_torch_dtype = {
+                    "uint16": torch.uint16,
+                    "int16": torch.int16,
+                    "uint8": torch.uint8,
+                    "int8": torch.int8,
+                }
+                if storage_type not in storage_type_to_torch_dtype:
+                    raise RuntimeError(
+                        f"Unsupported storage_type for separate embedding payload: {storage_type}"
+                    )
+                storage_dtype = storage_type_to_torch_dtype[storage_type]
+                payload_tensor = payload_tensor.to(storage_dtype).contiguous()
+                dtype_code = self._torch_dtype_code(storage_dtype)
+                raw = payload_tensor.numpy().tobytes(order="C")
+                dtype_name = storage_type
+        else:
+            dtype_code = self._torch_dtype_code(payload_tensor.dtype)
+            raw = payload_tensor.numpy().tobytes(order="C")
+            dtype_name = str(payload_tensor.dtype)
+        output_file.write(struct.pack("<IIQ", dtype_code, len(shape), len(raw)))
+        if shape:
+            output_file.write(struct.pack(f"<{len(shape)}I", *shape))
+        output_file.write(raw)
+        return {"dtype": dtype_name, "shape": shape}
+
+    def _dump_separate_embedding_matrix(self, payload):
+        output_path = os.path.join(
+            self.control_args.artifact, SEPARATE_EMBED_MATRIX_FILENAME
+        )
+        with open(output_path, "wb") as output_file:
+            # Magic 'SEMB', version=1, quantized flag.
+            output_file.write(
+                struct.pack("<4sII", b"SEMB", 1, 1 if payload["quantized"] else 0)
+            )
+            if payload["quantized"]:
+                qweight_info = self._write_tensor_block(
+                    output_file,
+                    payload["qweight"],
+                    storage_spec=payload["qweight_storage"],
+                )
+                scale_info = self._write_tensor_block(output_file, payload["scale"])
+                zp_info = self._write_tensor_block(output_file, payload["zp"])
+                weight_info = None
+            else:
+                weight_info = self._write_tensor_block(output_file, payload["weight"])
+                qweight_info = self._write_tensor_block(output_file, None)
+                scale_info = self._write_tensor_block(output_file, None)
+                zp_info = self._write_tensor_block(output_file, None)
+
+        return output_path, {
+            "format": "SEMB_v1",
+            "quantized": payload["quantized"],
+            "weight": weight_info,
+            "qweight": qweight_info,
+            "scale": scale_info,
+            "zp": zp_info,
+            "quant_scheme": payload.get("quant_scheme", None),
+            "quant_min": payload.get("quant_min", None),
+            "quant_max": payload.get("quant_max", None),
+        }
+
+    def _prune_dead_nodes(self, graph):
+        changed = True
+        while changed:
+            changed = False
+            for node in list(graph.nodes)[::-1]:
+                if node.op == "output":
+                    continue
+                if len(node.users) != 0:
+                    continue
+                graph.erase_node(node)
+                changed = True
+
+    def _rewrite_decoder_input_for_separate_embed(
+        self, decoder_graph_module, graph_name
+    ):
+        graph = decoder_graph_module.graph
+        tokens_node = self._find_tokens_placeholder(graph, graph_name)
+
+        split_node = self._extract_embedding_boundary(graph, tokens_node)
+        split_meta = dict(split_node.meta)
+        split_val = split_node.meta.get("val", None)
+        split_shape = list(split_val.shape) if hasattr(split_val, "shape") else None
+        split_dtype = str(split_val.dtype) if hasattr(split_val, "dtype") else None
+        hidden_states_example_input = None
+        if split_shape is not None:
+            hidden_states_example_input = torch.zeros(
+                split_shape,
+                dtype=split_val.dtype if hasattr(split_val, "dtype") else torch.float32,
+            )
+
+        with graph.inserting_before(tokens_node):
+            hidden_states_node = graph.placeholder("hidden_states")
+            hidden_states_node.meta = split_meta
+
+        split_node.replace_all_uses_with(hidden_states_node)
+        self._prune_dead_nodes(graph)
+        graph.lint()
+        decoder_graph_module.recompile()
+
+        input_placeholders = [
+            node.name for node in decoder_graph_module.graph.nodes if node.op == "placeholder"
+        ]
+        if not input_placeholders or input_placeholders[0] != "hidden_states":
+            raise RuntimeError(
+                f"Graph {graph_name} has invalid input order after separate embedding rewrite: {input_placeholders}"
+            )
+
+        info = {
+            "graph_name": graph_name,
+            "hidden_states_shape": split_shape,
+            "hidden_states_dtype": split_dtype,
+        }
+        return info, hidden_states_example_input
 
     @log_info
     def compile(self, request: Request):  # noqa: C901
@@ -809,23 +1222,22 @@ class HybridTextDecoder(Component):
                         raise RuntimeError("failed to override quantization attribute")
 
         if self.config.seq_mse_candidates != 0 and self.control_args.model_mode != "kv":
-            decode, prefill = self.decode.decoder, self.prefill.decoder
-            override_params(decode, prefill)
+            decode = self.decode.decoder
             if self.control_args.model_mode == "blender":
+                prefill = self.prefill.decoder
                 blender = self.blender.decoder
+                override_params(decode, prefill)
                 override_params(decode, blender)
+            else:
+                prefill = self.prefill.decoder
+                override_params(decode, prefill)
 
         # prepare lowering tok_embedding if applicable
         if self.apply_embedding:
             tok_embedding_data = request.method_data[TEXT_EMBEDDING]
-            if self.control_args.model_mode == "blender":
-                models = [
-                    d for d in [self.decode, self.prefill, self.blender] if d.tok_embedding is not None
-                ]
-            else:
-                models = [
-                    d for d in [self.decode, self.prefill] if d.tok_embedding is not None
-                ]                
+            models = [
+                d for d in [self.decode, self.prefill] if d.tok_embedding is not None
+            ]
             tok_embedding_example_inputs = [
                 m.tok_embedding_export_input for m in models if m is not None
             ]  # tokens
@@ -833,12 +1245,59 @@ class HybridTextDecoder(Component):
 
         # prepare lowering decoder
         data = request.method_data[TEXT_DECODER]
-        if self.control_args.model_mode == "blender":        
-            models = [d for d in [self.decode, self.prefill, self.blender] if d.decoder is not None]
+        if self.control_args.model_mode == "blender":
+            models = [
+                d
+                for d in [self.decode, self.prefill, self.blender]
+                if d.decoder is not None
+            ]
             graph_names = BLENDER_DECODER_GRAPH_NAMES[: len(models)]
         else:
             models = [d for d in [self.decode, self.prefill] if d.decoder is not None]
             graph_names = DECODER_GRAPH_NAMES[: len(models)]
+
+        if getattr(self.control_args, "separate_embed", False):
+            embedding_payload = self._extract_embedding_payload(
+                models[0].decoder, graph_names[0]
+            )
+            matrix_path, matrix_meta = self._dump_separate_embedding_matrix(
+                embedding_payload
+            )
+            separate_embed_info = []
+            for graph_name, model in zip(graph_names, models):
+                graph_info, hidden_states_input = (
+                    self._rewrite_decoder_input_for_separate_embed(
+                        model.decoder, graph_name
+                    )
+                )
+                if hidden_states_input is None:
+                    raise RuntimeError(
+                        f"Graph {graph_name} has no valid hidden_states shape after separate embedding rewrite."
+                    )
+                model.export_input = (
+                    hidden_states_input,
+                    *model.export_input[1:],
+                )
+                separate_embed_info.append(graph_info)
+            sidecar_path = os.path.join(
+                self.control_args.artifact, SEPARATE_EMBED_INFO_FILENAME
+            )
+            with open(sidecar_path, "w") as info_file:
+                json.dump(
+                    {
+                        "model_mode": self.control_args.model_mode,
+                        "embedding_matrix": {
+                            "file": os.path.basename(matrix_path),
+                            **matrix_meta,
+                        },
+                        "graphs": separate_embed_info,
+                    },
+                    info_file,
+                    indent=2,
+                )
+            logging.info("Saved separate embedding matrix to %s", matrix_path)
+            logging.info("Saved separate embedding sidecar to %s", sidecar_path)
+
         example_inputs = [m.export_input for m in models if m is not None]
 
         # start lowering

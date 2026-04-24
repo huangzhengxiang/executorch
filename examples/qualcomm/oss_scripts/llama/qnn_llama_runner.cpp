@@ -115,6 +115,14 @@ DEFINE_int32(
     blend_len,
     32,
     "Blend Length for BlenderMode");
+DEFINE_bool(
+    separate_embed,
+    false,
+    "Enable separate embedding runtime path (embedding is loaded from matrix file and fed as decoder input).");
+DEFINE_string(
+    embedding_matrix_path,
+    "",
+    "Path to separate embedding matrix file (e.g. separate_embed_matrix.bin). Required when --separate_embed=true.");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -264,8 +272,8 @@ void start_runner(
       FLAGS_decoder_model_version.c_str(),
       FLAGS_model_path.c_str(),
       FLAGS_tokenizer_path.c_str(),
-      FLAGS_dump_logits_path.c_str(),
       FLAGS_performance_output_path.c_str(),
+      FLAGS_dump_logits_path.c_str(),
       FLAGS_temperature,
       FLAGS_eval_mode,
       FLAGS_shared_buffer,
@@ -275,6 +283,8 @@ void start_runner(
       FLAGS_kv_store,
       FLAGS_test_level,
       FLAGS_blend_len,
+      FLAGS_separate_embed,
+      FLAGS_embedding_matrix_path.c_str(),
       FLAGS_dump_intermediate_outputs ? &etdump_gen : nullptr,
       nullptr,
       std::move(attention_sink_rope_module));
@@ -352,6 +362,11 @@ int main(int argc, char** argv) {
       FLAGS_eval_mode != 0) {
     ET_CHECK_MSG(
         false, "Only TokenGenerator(kv) mode is supported to dump all logits.");
+  }
+  if (FLAGS_separate_embed && FLAGS_embedding_matrix_path.empty()) {
+    ET_CHECK_MSG(
+        false,
+        "--embedding_matrix_path must be provided when --separate_embed=true.");
   }
 
   std::unique_ptr<executorch::extension::Module> module =

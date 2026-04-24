@@ -568,6 +568,7 @@ class Qwen3_0_6BQuantRecipe(StaticLLMQuantRecipe):
                 granularity=QuantGranularity.PER_CHANNEL,
             )
         )
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
 
 class Qwen3_1_7BQuantRecipe(StaticLLMQuantRecipe):

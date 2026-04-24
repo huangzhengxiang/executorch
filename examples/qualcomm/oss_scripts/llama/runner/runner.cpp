@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <type_traits>
 
 
 using executorch::extension::Module;
@@ -41,6 +43,73 @@ namespace llm = ::executorch::extension::llm;
 
 namespace example {
 namespace {
+constexpr uint32_t kEmbedDtypeFloat32 = 1;
+constexpr uint32_t kEmbedDtypeFloat16 = 2;
+constexpr uint32_t kEmbedDtypeInt8 = 3;
+constexpr uint32_t kEmbedDtypeUInt8 = 4;
+constexpr uint32_t kEmbedDtypeInt16 = 5;
+constexpr uint32_t kEmbedDtypeUInt16 = 6;
+constexpr uint32_t kEmbedDtypeInt32 = 7;
+constexpr uint32_t kEmbedDtypeInt64 = 8;
+constexpr uint32_t kEmbedDtypeInt4 = 9;
+
+const char* embed_dtype_code_to_string(uint32_t dtype_code) {
+  switch (dtype_code) {
+    case kEmbedDtypeFloat32:
+      return "float32";
+    case kEmbedDtypeFloat16:
+      return "float16";
+    case kEmbedDtypeInt8:
+      return "int8";
+    case kEmbedDtypeUInt8:
+      return "uint8";
+    case kEmbedDtypeInt16:
+      return "int16";
+    case kEmbedDtypeUInt16:
+      return "uint16";
+    case kEmbedDtypeInt32:
+      return "int32";
+    case kEmbedDtypeInt64:
+      return "int64";
+    case kEmbedDtypeInt4:
+      return "int4";
+    default:
+      return "unknown";
+  }
+}
+
+bool is_embed_dtype_compatible(
+    executorch::aten::ScalarType scalar_type,
+    uint32_t dtype_code) {
+  switch (dtype_code) {
+    case kEmbedDtypeFloat32:
+      return scalar_type == executorch::aten::ScalarType::Float;
+    case kEmbedDtypeFloat16:
+      return scalar_type == executorch::aten::ScalarType::Half;
+    case kEmbedDtypeInt8:
+      return scalar_type == executorch::aten::ScalarType::Char;
+    case kEmbedDtypeUInt8:
+      return scalar_type == executorch::aten::ScalarType::Byte;
+    case kEmbedDtypeInt16:
+      return scalar_type == executorch::aten::ScalarType::Short;
+    case kEmbedDtypeUInt16:
+      return scalar_type == executorch::aten::ScalarType::UInt16;
+    case kEmbedDtypeInt32:
+      return scalar_type == executorch::aten::ScalarType::Int;
+    case kEmbedDtypeInt64:
+      return scalar_type == executorch::aten::ScalarType::Long;
+    case kEmbedDtypeInt4:
+      return scalar_type == executorch::aten::ScalarType::Bits4x2;
+    default:
+      return false;
+  }
+}
+
+bool can_dequantize_embed_dtype_to_float(uint32_t dtype_code) {
+  return dtype_code == kEmbedDtypeUInt8 || dtype_code == kEmbedDtypeInt8 ||
+      dtype_code == kEmbedDtypeUInt16 || dtype_code == kEmbedDtypeInt16;
+}
+
 void print_performance_report(
     const Stats& stats,
     const std::string& performance_output_path) {
@@ -94,8 +163,8 @@ Runner<T>::Runner(
     const std::string& decoder_model_version,
     const std::string& model_path,
     const std::string& tokenizer_path,
-    const std::string& dump_logits_path,
     const std::string& performance_output_path,
+    const std::string& dump_logits_path,
     const float temperature,
     const int eval_mode,
     const bool shared_buffer,
@@ -105,6 +174,8 @@ Runner<T>::Runner(
     const bool use_kv_store,
     const int test_level,
     const int blend_len,
+    const bool separate_embed,
+    const std::string& embedding_matrix_path,
     torch::executor::EventTracer* event_tracer,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
@@ -115,6 +186,8 @@ Runner<T>::Runner(
       use_kv_store_(use_kv_store),
       test_level_(test_level),
       blend_len_(blend_len),
+      separate_embed_(separate_embed),
+      embedding_matrix_path_(embedding_matrix_path),
       tokenizer_path_(tokenizer_path),
       performance_output_path_(performance_output_path),
       dump_logits_path_(dump_logits_path),
@@ -165,8 +238,11 @@ Runner<T>::Runner(
 
 template <typename T>
 bool Runner<T>::is_loaded() const {
+  const bool separate_embed_ready =
+      !separate_embed_ || separate_embedding_.is_loaded();
   return module_->is_loaded() && tokenizer_ && decoder_runner_ &&
-      prompt_processor_ && token_generator_ && kv_manager_ && buffer_manager_;
+      prompt_processor_ && token_generator_ && kv_manager_ && buffer_manager_ &&
+      separate_embed_ready;
 }
 
 template <typename T>
@@ -191,10 +267,16 @@ Error Runner<T>::load() {
       method_names.emplace_back(token_generator_method_name);
       break;
     case EvalMode::kBlend:
-      prompt_processor_method_name = "prefill_forward";
+      // Prefer prefill_forward when available so blender mode can keep
+      // prefill metadata/io chain; fall back to blender_forward for old pte.
+      prompt_processor_method_name = module_->method_names()->count("prefill_forward")
+          ? "prefill_forward"
+          : "blender_forward";
       token_generator_method_name = "kv_forward";
       blender_method_name = "blender_forward";
-      method_names.emplace_back(prompt_processor_method_name);
+      if (prompt_processor_method_name != blender_method_name) {
+        method_names.emplace_back(prompt_processor_method_name);
+      }
       method_names.emplace_back(token_generator_method_name);
       method_names.emplace_back(blender_method_name);
       break;
@@ -258,8 +340,81 @@ Error Runner<T>::load() {
   auto k_cache_shape = method_meta->output_tensor_meta(1)->sizes();
   int64_t num_heads = k_cache_shape[1];
   int64_t head_dim = k_cache_shape[2];
-  bool use_int64_token = method_meta->input_tensor_meta(0)->scalar_type() ==
-      executorch::aten::ScalarType::Long;
+  if (separate_embed_ && eval_mode_ == EvalMode::kLookaheadDecoding) {
+    ET_LOG(Error, "separate_embed currently does not support lookahead mode.");
+    return Error::Internal;
+  }
+  bool use_int64_token = !separate_embed_ &&
+      (method_meta->input_tensor_meta(0)->scalar_type() ==
+       executorch::aten::ScalarType::Long);
+  int32_t embedding_dim = 0;
+  size_t embedding_input_elem_size = 0;
+  bool dequantize_separate_embed_to_fp32 = false;
+  if (separate_embed_) {
+    ET_CHECK_MSG(
+        !embedding_matrix_path_.empty(),
+        "separate_embed is enabled but embedding_matrix_path is empty.");
+    const auto embedding_input_meta = method_meta->input_tensor_meta(0);
+    const auto embedding_scalar_type = embedding_input_meta->scalar_type();
+    const auto& embedding_input_sizes = embedding_input_meta->sizes();
+    ET_CHECK_MSG(
+        !embedding_input_sizes.empty(),
+        "Invalid embedding input shape for separate_embed.");
+    embedding_dim =
+        static_cast<int32_t>(embedding_input_sizes[embedding_input_sizes.size() - 1]);
+    embedding_input_elem_size =
+        executorch::runtime::elementSize(embedding_scalar_type);
+    if (!separate_embedding_.load(embedding_matrix_path_)) {
+      return Error::Internal;
+    }
+    const uint32_t embedding_dtype_code = separate_embedding_.embedding_dtype_code();
+    const bool direct_dtype_match =
+        is_embed_dtype_compatible(embedding_scalar_type, embedding_dtype_code);
+    dequantize_separate_embed_to_fp32 =
+        !direct_dtype_match && separate_embedding_.is_quantized() &&
+        embedding_scalar_type == executorch::aten::ScalarType::Float &&
+        can_dequantize_embed_dtype_to_float(embedding_dtype_code);
+    ET_CHECK_MSG(
+        direct_dtype_match || dequantize_separate_embed_to_fp32,
+        "Embedding dtype mismatch: model expects %s but matrix stores %s (code=%u).",
+        executorch::runtime::toString(embedding_scalar_type),
+        embed_dtype_code_to_string(embedding_dtype_code),
+        embedding_dtype_code);
+    const size_t model_row_bytes =
+        static_cast<size_t>(embedding_dim) * embedding_input_elem_size;
+    const size_t matrix_row_bytes = separate_embedding_.row_bytes();
+    if (direct_dtype_match) {
+      ET_CHECK_MSG(
+          model_row_bytes == matrix_row_bytes,
+          "Embedding row byte-size mismatch: model expects %zu bytes per token but matrix stores %zu bytes per token.",
+          model_row_bytes,
+          matrix_row_bytes);
+    } else {
+      ET_LOG(
+          Info,
+          "Separate embedding runtime row dequant is enabled (matrix dtype=%s -> model dtype=%s).",
+          embed_dtype_code_to_string(embedding_dtype_code),
+          executorch::runtime::toString(embedding_scalar_type));
+    }
+    ET_CHECK_MSG(
+        separate_embedding_.embedding_dim() == embedding_dim,
+        "Embedding dim mismatch: model expects %d but matrix has %d",
+        embedding_dim,
+        separate_embedding_.embedding_dim());
+    ET_CHECK_MSG(
+        separate_embedding_.vocab_size() == vocab_size,
+        "Embedding vocab mismatch: model expects %d but matrix has %d",
+        vocab_size,
+        separate_embedding_.vocab_size());
+    ET_LOG(
+        Info,
+        "Separate embedding enabled: model dtype=%s matrix dtype=%s (code=%u), model_row_bytes=%zu matrix_row_bytes=%zu.",
+        executorch::runtime::toString(embedding_scalar_type),
+        embed_dtype_code_to_string(embedding_dtype_code),
+        embedding_dtype_code,
+        model_row_bytes,
+        matrix_row_bytes);
+  }
 
   // Use attention mask length to retrieve AR length and context length
   // Cache len equals to context_len - ar_len
@@ -324,7 +479,12 @@ Error Runner<T>::load() {
           vocab_size,
           use_int64_token,
           sliding_window,
-          cache_mode_});
+          cache_mode_,
+          separate_embed_,
+          embedding_dim,
+          embedding_input_elem_size,
+          dequantize_separate_embed_to_fp32,
+          separate_embed_ ? &separate_embedding_ : nullptr});
   if (eval_mode_ == EvalMode::kBlend) {
     blender_prompt_processor_ = std::make_unique<BlenderPromptProcessor<T>>(
         decoder_runner_.get(),
@@ -339,7 +499,12 @@ Error Runner<T>::load() {
             vocab_size,
             use_int64_token,
             sliding_window,
-            cache_mode_});
+            cache_mode_,
+            separate_embed_,
+            embedding_dim,
+            embedding_input_elem_size,
+            dequantize_separate_embed_to_fp32,
+            separate_embed_ ? &separate_embedding_ : nullptr});
   }
   if (eval_mode_ == EvalMode::kLookaheadDecoding) {
     token_generator_ = std::make_unique<LhdTokenGenerator<T>>(
@@ -376,7 +541,12 @@ Error Runner<T>::load() {
             vocab_size,
             use_int64_token,
             sliding_window,
-            cache_mode_},
+            cache_mode_,
+            separate_embed_,
+            embedding_dim,
+            embedding_input_elem_size,
+            dequantize_separate_embed_to_fp32,
+            separate_embed_ ? &separate_embedding_ : nullptr},
         &stats_);
   }
 
@@ -404,6 +574,94 @@ Error Runner<T>::load() {
 }
 
 template <typename T>
+void Runner<T>::load_kv_quant_attrs() {
+  kv_output_quant_attrs_.clear();
+  if (!is_loaded() || module_ == nullptr ||
+      module_->method_names()->count("get_n_layers") == 0) {
+    return;
+  }
+
+  auto n_layers_res = module_->get("get_n_layers");
+  if (!n_layers_res.ok() || !n_layers_res->isScalar()) {
+    ET_LOG(Info, "Failed to read get_n_layers for kv quant attrs.");
+    return;
+  }
+  int64_t num_layers = n_layers_res->toScalar().to<int64_t>();
+  if (num_layers <= 0) {
+    return;
+  }
+
+  const int32_t quant_min = static_cast<int32_t>(std::numeric_limits<T>::lowest());
+  const int32_t quant_max = static_cast<int32_t>(std::numeric_limits<T>::max());
+  const std::string dtype =
+      std::is_same<T, uint8_t>::value ? "torch.uint8" : "torch.uint16";
+  kv_output_quant_attrs_.reserve(num_layers * 2);
+
+  auto read_scale = [&](const std::string& method_name, float* out) -> bool {
+    if (module_->method_names()->count(method_name) == 0) {
+      return false;
+    }
+    auto value = module_->get(method_name);
+    if (!value.ok()) {
+      return false;
+    }
+    if (value->isDouble()) {
+      *out = static_cast<float>(value->toDouble());
+      return true;
+    }
+    if (value->isInt()) {
+      *out = static_cast<float>(value->toInt());
+      return true;
+    }
+    return false;
+  };
+
+  auto read_zero_point =
+      [&](const std::string& method_name, int32_t* out) -> bool {
+    if (module_->method_names()->count(method_name) == 0) {
+      return false;
+    }
+    auto value = module_->get(method_name);
+    if (!value.ok()) {
+      return false;
+    }
+    if (value->isInt()) {
+      *out = static_cast<int32_t>(value->toInt());
+      return true;
+    }
+    if (value->isDouble()) {
+      *out = static_cast<int32_t>(value->toDouble());
+      return true;
+    }
+    return false;
+  };
+
+  for (int i = 0; i < num_layers; ++i) {
+    float k_scale = 0.f;
+    int32_t k_zero_point = 0;
+    if (read_scale("get_k_scale_output_" + std::to_string(i), &k_scale) &&
+        read_zero_point(
+            "get_k_zero_point_output_" + std::to_string(i), &k_zero_point)) {
+      kv_output_quant_attrs_.push_back(
+          {k_scale, k_zero_point, quant_min, quant_max, dtype});
+      ET_LOG(Info, "K kv quant[%d]: scale=%f, zp=%d", i, k_scale, k_zero_point);
+    }
+
+    float v_scale = 0.f;
+    int32_t v_zero_point = 0;
+    if (read_scale("get_v_scale_output_" + std::to_string(i), &v_scale) &&
+        read_zero_point(
+            "get_v_zero_point_output_" + std::to_string(i), &v_zero_point)) {
+      kv_output_quant_attrs_.push_back(
+          {v_scale, v_zero_point, quant_min, quant_max, dtype});
+      ET_LOG(Info, "V kv quant[%d]: scale=%f, zp=%d", i, v_scale, v_zero_point);
+    }
+  }
+
+  ET_LOG(Info, "Loaded %zu kv quant attrs from metadata.", kv_output_quant_attrs_.size());
+}
+
+template <typename T>
 Error Runner<T>::generate(
     const std::string& prompt,
     const llm::GenerationConfig& config,
@@ -426,6 +684,7 @@ Error Runner<T>::generate_from_prompt_or_file(
     ET_CHECK_OK_OR_RETURN_ERROR(load());
     stats_.model_load_end_ms = time_in_ms();
   }
+  load_kv_quant_attrs();
   stats_.inference_start_ms = time_in_ms();
 
   int32_t seq_len = config.seq_len;
