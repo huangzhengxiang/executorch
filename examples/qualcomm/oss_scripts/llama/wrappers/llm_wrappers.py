@@ -1110,7 +1110,6 @@ class TextDecoder(Component):
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
             
-<<<<<<< HEAD
             if prepared_outputs_for_compare is not None:
                 converted_outputs_for_compare = self._collect_layer_hidden_states(
                     self.decoder
@@ -1131,7 +1130,6 @@ class TextDecoder(Component):
             #     self._compare_with_saved_embedding_reference()
 
             # ppl test after quant
-=======
             # store quant info for debug purpose only
             # _store_graph_quant_attrs(self.decoder, get_graph_name(self.mode), os.path.join(self.control_args.artifact, "quant_attrs"))
             if False:
@@ -1155,7 +1153,6 @@ class TextDecoder(Component):
                             match_item = torch.argmin(torch.abs(scales-node.args[1])/scales+torch.abs(zp-node.args[2])/zp)
                             print(f"blender_debug: {node.args[0:3]}, decode matched: {decode_quant_attrs[match_item][0:3]}, match score: {match_score}")
 
->>>>>>> origin/main
             if self.mode == Mode.PREFILL or self.mode == Mode.BLENDER:
                 self._calibrate(
                     model=self.decoder,
