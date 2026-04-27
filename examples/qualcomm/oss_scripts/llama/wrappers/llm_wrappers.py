@@ -8,11 +8,8 @@ import inspect
 import json
 import logging
 import os
-<<<<<<< HEAD
 import re
-=======
 import struct
->>>>>>> origin/main
 import types
 
 from functools import partial
