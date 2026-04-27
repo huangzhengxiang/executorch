@@ -122,11 +122,13 @@ class DatasetBuilder:
         )
         for prompt in prompts:
             # Apply chat template formatting if available (for instruction-tuned/reasoning models)
+            # Embedding models should calibrate on raw prompt text.
             prompt = (
                 self.tokenizer_wrapper.apply_prompt_template(
                     chat_template, prompt, self.control_args.system_prompt
                 )
                 if chat_template is not None
+                and not getattr(self.config, "is_embedding", False)
                 else prompt
             )
 

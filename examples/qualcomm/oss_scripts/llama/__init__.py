@@ -73,6 +73,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Phi4MiniQuantRecipe,
     Qwen2_5_0_5BQuantRecipe,
     Qwen2_5_1_5BQuantRecipe,
+    Qwen3_Embedding_0_6BQuantRecipe,
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
     Smollm2QuantRecipe,
@@ -115,6 +116,7 @@ class LLMModelConfig(ABC):
     r1: Enable SpinQuant R1 quantization optimization.
     r2: Enable SpinQuant R2 quantization optimization.
     r3: Enable SpinQuant R3 quantization optimization.
+    is_embedding: Set to true to export last hidden states instead of logits.
     quant_recipe: Quantization recipe to use when setting quant configs for the model.
     """
 
@@ -131,6 +133,7 @@ class LLMModelConfig(ABC):
     r1: bool
     r2: bool
     r3: bool
+    is_embedding: bool = False
     quant_recipe: StaticLLMQuantRecipe
 
     def __str__(self):  # noqa: C901
@@ -460,10 +463,30 @@ class Qwen3_0_6B(LLMModelConfig):
     quant_recipe = Qwen3_0_6BQuantRecipe
 
 
+@register_llm_model("qwen3-embed-0_6b")
+@dataclass(init=False, frozen=True)
+class Qwen3_Embedding_0_6B(LLMModelConfig):
+    repo_id: str = "/root/autodl-tmp/model/Qwen3-Embedding-0.6B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/0_6b_embedding_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+    is_embedding = True
+    quant_recipe = Qwen3_Embedding_0_6BQuantRecipe
+
+
 @register_llm_model("qwen3-1_7b")
 @dataclass(init=False, frozen=True)
 class Qwen3_1_7B(LLMModelConfig):
-    repo_id: str = "Qwen/Qwen3-1.7B"
+    repo_id: str = "/root/autodl-tmp/model/Qwen3-1.7B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3/config/1_7b_config.json"
     )

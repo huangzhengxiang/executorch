@@ -56,6 +56,7 @@ DECODER_MODEL_VERSION = {
     "qwen2_5-0_5b": "qwen2_5",
     "qwen2_5-1_5b": "qwen2_5",
     "qwen3-0_6b": "qwen3",
+    "qwen3-embed-0_6b": "qwen3_embed",
     "qwen3-1_7b": "qwen3",
     "smollm2_135m": "smollm2_135m",
     "smollm3-3b": "smollm3",

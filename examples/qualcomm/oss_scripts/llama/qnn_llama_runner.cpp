@@ -201,6 +201,9 @@ std::string get_formatted_prompt(
       }
       formatted_prompt.append("<|im_start|>assistant");
       break;
+    case example::DecoderModelVersion::kQwen3Embed:
+      formatted_prompt.append(prompt);
+      break;
     case example::DecoderModelVersion::kSmollm2_135m:
       if (!system_prompt.empty()) {
         formatted_prompt.append("<|im_start|>system\n");

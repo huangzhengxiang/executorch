@@ -429,9 +429,6 @@ void KVManager<T>::blender_update_cache(
       int32_t n_past,
       int32_t blend_len,
       int32_t* imp_indices) {
-  for (int i = 0; i < blend_len; ++i) {
-    ET_LOG(Info, "imp_indices[%d]: %d", i, imp_indices[i]);
-  }
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
     blender_update_key(k_cache_[layer], ar_len, n_past, blend_len, imp_indices);
     blender_update_value(v_cache_[layer], ar_len, n_past, blend_len, imp_indices);
@@ -469,7 +466,7 @@ void KVManager<T>::blender_update_key(
   for (int i = 0; i < n_iter; ++i) {
     for (int j = 0; j < blend_len; ++j) {
       write_ptr[imp_indices[j]] = read_ptr[j];
-      ET_LOG(Info, "read_ptr[%d, %d]: %d", i, j, (int)read_ptr[j]);
+      // ET_LOG(Info, "read_ptr[%d, %d]: %d", i, j, (int)read_ptr[j]);
     }
     write_ptr += iter_size;
     read_ptr += out_size;

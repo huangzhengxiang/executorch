@@ -91,6 +91,49 @@ set_target_properties(
   qnn_llama_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
 )
 
+# build qnn llama bench
+set(_llama_bench__srcs ${_llama_runner__srcs})
+list(FILTER _llama_bench__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")
+list(
+  PREPEND
+  _llama_bench__srcs
+  ${CMAKE_CURRENT_LIST_DIR}/qnn_llama_bench.cpp
+)
+
+list(APPEND _llama_bench__srcs)
+
+add_executable(qnn_llama_bench ${_llama_bench__srcs})
+target_include_directories(
+  qnn_llama_bench PUBLIC ${_common_include_directories}
+                         ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/include/
+                         ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/
+)
+target_link_libraries(
+  qnn_llama_bench
+  LMStore
+  qnn_executorch_backend
+  executorch_core
+  extension_data_loader
+  extension_flat_tensor
+  extension_llm_runner
+  extension_module
+  extension_tensor
+  etdump
+  flatccrt
+  gflags
+  custom_ops
+  quantized_ops_lib
+  quantized_kernels
+  tokenizers::tokenizers
+)
+target_include_directories(
+  qnn_llama_bench PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
+)
+target_compile_options(qnn_llama_bench PUBLIC ${_common_compile_options})
+set_target_properties(
+  qnn_llama_bench PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+)
+
 # build qnn multimodal runner preprocess qnn runner src files for multimodal
 set(_multimodal_runner__srcs ${_llama_runner__srcs})
 list(FILTER _multimodal_runner__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")

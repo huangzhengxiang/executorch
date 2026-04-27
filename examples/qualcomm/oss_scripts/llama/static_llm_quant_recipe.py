@@ -533,6 +533,22 @@ class Qwen2_5_1_5BQuantRecipe(StaticLLMQuantRecipe):
             )
         )
 
+class Qwen3_Embedding_0_6BQuantRecipe(StaticLLMQuantRecipe):
+    default_quant_dtype = QuantDtype.use_16a16w
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+
+        self.recipe = (
+            QuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+            )
+        )
+
 
 class Qwen3_0_6BQuantRecipe(StaticLLMQuantRecipe):
     default_quant_dtype = QuantDtype.use_16a4w

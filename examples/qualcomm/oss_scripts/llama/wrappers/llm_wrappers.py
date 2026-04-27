@@ -8,12 +8,14 @@ import inspect
 import json
 import logging
 import os
+import re
 import types
 
 from functools import partial
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from executorch.backends.qualcomm._passes import FoldQDQ, I64toI32, TagQuantIO
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
@@ -114,6 +116,7 @@ class TextDecoder(Component):
         self.quant_recipe: StaticLLMQuantRecipe = (
             self.config.quant_recipe(True) if self.config.quant_recipe else None
         )
+        self.is_embedding = getattr(self.config, "is_embedding", False)
         self.blend_config = None
 
         # For multimodal embedding
@@ -306,6 +309,10 @@ class TextDecoder(Component):
             # For gemma, we have preprocessed the weight of rmsnorm
             self.model_args.norm_type = "rmsnorm"
 
+        model_specific_kwargs = get_model_specific_kwargs(
+            self.control_args, self.config
+        )
+        model_specific_kwargs["is_embedding"] = self.is_embedding
         decoder: LlamaModel = LLM_VARIANT_ARCHS.get(
             self.control_args.decoder_model, LlamaModel
         )(
@@ -314,7 +321,7 @@ class TextDecoder(Component):
             output_new_cache_only=True,
             output_cache=True,
             use_i64_token=use_i64_token,
-            **get_model_specific_kwargs(self.control_args, self.config),
+            **model_specific_kwargs,
         )
 
         self.meta = decoder.get_metadata()
@@ -329,17 +336,17 @@ class TextDecoder(Component):
             *(self.example_input[4] if decoder.use_kv_cache else []),  # v_caches
             *((self.example_input[5],) if decoder.use_blend else []),  # valid_mask
         )
+        output_dim = decoder.dim if self.is_embedding else decoder.vocab_size
         self.io_shape = {
-            # logit output
             (
                 decoder.max_batch_size,
                 decoder.ar_len,
-                decoder.vocab_size,
+                output_dim,
             ),
             (
                 decoder.max_batch_size,
                 decoder.blend_len,
-                decoder.vocab_size,
+                output_dim,
             ),
         }
         # shape of k caches and v caches
@@ -379,6 +386,421 @@ class TextDecoder(Component):
                             self.meta["get_logits_scale"] = output_node.args[1]
                             self.meta["get_logits_zero_point"] = output_node.args[2]
                             break
+
+    def _extract_layer_idx(self, node: torch.fx.Node):
+        pattern = r"layers[._](\d+)"
+        candidates = [node.name]
+        nn_stack = node.meta.get("nn_module_stack", None)
+        if nn_stack is not None:
+            candidates.append(str(nn_stack.values()))
+
+        def gather_node_sources(node_source):
+            if node_source is None:
+                return
+            for src in node_source:
+                name = getattr(src, "name", None)
+                if isinstance(name, str):
+                    candidates.append(name)
+                gather_node_sources(getattr(src, "from_node", None))
+
+        gather_node_sources(node.meta.get("from_node", None))
+        for candidate in candidates:
+            match = re.search(pattern, candidate)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _collect_layer_hidden_states(
+        self, graph_module: torch.fx.GraphModule
+    ) -> Dict[int, torch.Tensor]:
+        layer_outputs = {}
+        expected_dim = self.meta["get_dim"]
+
+        class LayerOutputCollector(torch.fx.Interpreter):
+            def __init__(self, gm, parent):
+                super().__init__(gm)
+                self.parent = parent
+
+            def run_node(self, n):
+                out = super().run_node(n)
+                if (
+                    isinstance(out, torch.Tensor)
+                    and out.dim() == 3
+                    and out.shape[-1] == expected_dim
+                ):
+                    layer_idx = self.parent._extract_layer_idx(n)
+                    if layer_idx is not None:
+                        layer_outputs[layer_idx] = out.detach().float().cpu()
+                return out
+
+        LayerOutputCollector(graph_module, self).run(*self.export_input)
+        return layer_outputs
+
+    def _compare_prepared_vs_converted_by_layer(
+        self,
+        prepared_outputs: Dict[int, torch.Tensor],
+        converted_outputs: Dict[int, torch.Tensor],
+    ):
+        common_layers = sorted(
+            set(prepared_outputs.keys()) & set(converted_outputs.keys())
+        )
+        if not common_layers:
+            logging.warning(
+                "Layer-wise compare skipped: no matched layer hidden states were found."
+            )
+            return
+
+        for layer_idx in common_layers:
+            fp_out = prepared_outputs[layer_idx]
+            qdq_out = converted_outputs[layer_idx]
+            if fp_out.shape != qdq_out.shape:
+                logging.warning(
+                    "[LayerCompare][%s] layer=%d shape mismatch: %s vs %s",
+                    self.mode.name,
+                    layer_idx,
+                    tuple(fp_out.shape),
+                    tuple(qdq_out.shape),
+                )
+                continue
+            mse = torch.mean((fp_out - qdq_out) ** 2).item()
+            fp_energy = torch.mean(fp_out**2).item() + 1e-12
+            nmse = mse / fp_energy
+            cos = (
+                F.cosine_similarity(
+                    fp_out.reshape(-1, fp_out.shape[-1]),
+                    qdq_out.reshape(-1, qdq_out.shape[-1]),
+                    dim=-1,
+                )
+                .mean()
+                .item()
+            )
+            logging.info(
+                "[LayerCompare][%s] layer=%d mse=%.6e nmse=%.6e cos=%.6f",
+                self.mode.name,
+                layer_idx,
+                mse,
+                nmse,
+                cos,
+            )
+
+    def _pick_first_node_arg(self, args):
+        if isinstance(args, torch.fx.Node):
+            return args
+        if isinstance(args, (tuple, list)):
+            for item in args:
+                picked = self._pick_first_node_arg(item)
+                if picked is not None:
+                    return picked
+        return None
+
+    def _get_output_predecessor_chain(
+        self, graph_module: torch.fx.GraphModule, num_predecessors: int = 5
+    ) -> List[torch.fx.Node]:
+        output_node = None
+        for node in graph_module.graph.nodes:
+            if node.op == "output":
+                output_node = node
+                break
+        if output_node is None:
+            return []
+
+        logits_node = self._pick_first_node_arg(output_node.args)
+        if logits_node is None:
+            return []
+
+        chain = [logits_node]
+        current = logits_node
+        for _ in range(num_predecessors):
+            prev = self._pick_first_node_arg(current.args)
+            if prev is None:
+                break
+            chain.append(prev)
+            current = prev
+        return chain
+
+    def _collect_output_predecessor_tensors(
+        self, graph_module: torch.fx.GraphModule, num_predecessors: int = 5
+    ) -> List[Tuple[str, torch.Tensor]]:
+        chain_nodes = self._get_output_predecessor_chain(
+            graph_module, num_predecessors=num_predecessors
+        )
+        if not chain_nodes:
+            return []
+        target_names = {node.name for node in chain_nodes}
+        captured = {}
+
+        class OutputPredCollector(torch.fx.Interpreter):
+            def run_node(self, n):
+                out = super().run_node(n)
+                if n.name in target_names and isinstance(out, torch.Tensor):
+                    captured[n.name] = out.detach().float().cpu()
+                return out
+
+        OutputPredCollector(graph_module).run(*self.export_input)
+        ordered = []
+        for node in chain_nodes:
+            if node.name in captured:
+                ordered.append((node.name, captured[node.name]))
+        return ordered
+
+    def _compare_output_and_predecessors(
+        self,
+        prepared_tensors: List[Tuple[str, torch.Tensor]],
+        converted_tensors: List[Tuple[str, torch.Tensor]],
+    ):
+        n = min(len(prepared_tensors), len(converted_tensors))
+        if n == 0:
+            logging.warning(
+                "[OutPredCompare][%s] skipped: no output/predecessor tensors found.",
+                self.mode.name,
+            )
+            return
+
+        for idx in range(n):
+            fp_name, fp_out = prepared_tensors[idx]
+            qdq_name, qdq_out = converted_tensors[idx]
+            if fp_out.shape != qdq_out.shape:
+                logging.warning(
+                    "[OutPredCompare][%s] depth=%d fp=%s qdq=%s shape mismatch: %s vs %s",
+                    self.mode.name,
+                    idx,
+                    fp_name,
+                    qdq_name,
+                    tuple(fp_out.shape),
+                    tuple(qdq_out.shape),
+                )
+                continue
+            mse = torch.mean((fp_out - qdq_out) ** 2).item()
+            fp_energy = torch.mean(fp_out**2).item() + 1e-12
+            nmse = mse / fp_energy
+            cos = F.cosine_similarity(
+                fp_out.reshape(1, -1), qdq_out.reshape(1, -1), dim=-1
+            ).item()
+            logging.info(
+                "[OutPredCompare][%s] depth=%d fp=%s qdq=%s mse=%.6e nmse=%.6e cos=%.6f",
+                self.mode.name,
+                idx,
+                fp_name,
+                qdq_name,
+                mse,
+                nmse,
+                cos,
+            )
+
+    def _get_embedding_reference_model_path(self) -> str:
+        default_path = os.path.join(
+            self.control_args.artifact, "qwen3_embed_limit10_reference.pt2"
+        )
+        return os.getenv("LLAMA_EMBED_REF_MODEL_PATH", default_path)
+
+    def _get_embedding_replaced_model_save_path(self) -> str:
+        default_path = os.path.join(
+            self.control_args.artifact, "qwen3_embed_replaced_from_saved_ref.pt2"
+        )
+        return os.getenv("LLAMA_EMBED_REPLACED_MODEL_PATH", default_path)
+
+    def _compare_with_saved_embedding_reference(self):
+        ref_path = self._get_embedding_reference_model_path()
+        if not os.path.exists(ref_path):
+            logging.warning(
+                "[SavedModelCompare][%s] skipped: reference model not found at %s",
+                self.mode.name,
+                ref_path,
+            )
+            return
+        try:
+            ref_decoder = torch.export.load(ref_path).module()
+            ref_tensors = self._collect_output_predecessor_tensors(
+                ref_decoder, num_predecessors=0
+            )
+            cur_tensors = self._collect_output_predecessor_tensors(
+                self.decoder, num_predecessors=0
+            )
+            logging.info(
+                "[SavedModelCompare][%s] compare current convert_pt2e model against %s",
+                self.mode.name,
+                ref_path,
+            )
+            self._compare_output_and_predecessors(ref_tensors, cur_tensors)
+        except Exception as e:
+            logging.warning(
+                "[SavedModelCompare][%s] skipped: failed to load/compare reference model %s due to %s",
+                self.mode.name,
+                ref_path,
+                str(e),
+            )
+
+    def _get_quant_arg_indices(
+        self, node: torch.fx.Node
+    ) -> Tuple[int, int, int, int] | None:
+        if node.op != "call_function" or not hasattr(node.target, "_schema"):
+            return None
+        schema = node.target._schema
+        arg_names = [arg.name for arg in schema.arguments]
+
+        def find_idx(candidates: List[str]):
+            for name in candidates:
+                if name in arg_names:
+                    return arg_names.index(name)
+            return None
+
+        scale_idx = find_idx(["scale", "scales"])
+        zero_point_idx = find_idx(["zero_point", "zero_points"])
+        quant_min_idx = find_idx(["quant_min", "min"])
+        quant_max_idx = find_idx(["quant_max", "max"])
+        if (
+            scale_idx is None
+            or zero_point_idx is None
+            or quant_min_idx is None
+            or quant_max_idx is None
+        ):
+            return None
+        return scale_idx, zero_point_idx, quant_min_idx, quant_max_idx
+
+    def _resolve_quant_arg_value(self, graph_module: torch.fx.GraphModule, arg):
+        if isinstance(arg, torch.fx.Node):
+            if arg.op != "get_attr":
+                raise RuntimeError(
+                    f"Unsupported quant arg producer {arg.op} for node {arg.name}"
+                )
+            return getattr(graph_module, arg.target)
+        return arg
+
+    def _to_scalar(self, value, desc: str):
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise RuntimeError(
+                    f"{desc} should be scalar, got tensor shape {tuple(value.shape)}"
+                )
+            return value.item()
+        return value
+
+    def _assign_quant_arg_value(
+        self, graph_module: torch.fx.GraphModule, node: torch.fx.Node, idx: int, value
+    ) -> None:
+        current_arg = node.args[idx]
+        if isinstance(current_arg, torch.fx.Node):
+            if current_arg.op != "get_attr":
+                raise RuntimeError(
+                    f"Unsupported quant arg consumer {current_arg.op} for node {node.name}"
+                )
+            if isinstance(value, torch.Tensor):
+                setattr(graph_module, current_arg.target, value.detach().clone())
+            else:
+                setattr(graph_module, current_arg.target, value)
+            return
+
+        new_args = list(node.args)
+        if isinstance(value, torch.Tensor):
+            raise RuntimeError(
+                f"Expected scalar quant arg for node {node.name} index {idx}, got tensor"
+            )
+        new_args[idx] = value
+        node.args = tuple(new_args)
+
+    def _replace_quant_scale_zero_point_with_saved_embedding_reference(self):
+        ref_path = self._get_embedding_reference_model_path()
+        if not os.path.exists(ref_path):
+            logging.warning(
+                "[SavedModelReplace][%s] skipped: reference model not found at %s",
+                self.mode.name,
+                ref_path,
+            )
+            return
+
+        ref_decoder = torch.export.load(ref_path).module()
+        ref_nodes = []
+        cur_nodes = []
+        for node in ref_decoder.graph.nodes:
+            if self._get_quant_arg_indices(node) is not None:
+                ref_nodes.append(node)
+        for node in self.decoder.graph.nodes:
+            if self._get_quant_arg_indices(node) is not None:
+                cur_nodes.append(node)
+
+        if len(ref_nodes) != len(cur_nodes):
+            raise RuntimeError(
+                "[SavedModelReplace] quant node count mismatch: "
+                f"reference={len(ref_nodes)} current={len(cur_nodes)}"
+            )
+
+        for idx, (ref_node, cur_node) in enumerate(zip(ref_nodes, cur_nodes)):
+            if str(ref_node.target) != str(cur_node.target):
+                raise RuntimeError(
+                    "[SavedModelReplace] quant node target mismatch at index "
+                    f"{idx}: reference={ref_node.target} current={cur_node.target}"
+                )
+
+            (
+                ref_scale_idx,
+                ref_zero_point_idx,
+                ref_quant_min_idx,
+                ref_quant_max_idx,
+            ) = self._get_quant_arg_indices(ref_node)
+            (
+                cur_scale_idx,
+                cur_zero_point_idx,
+                cur_quant_min_idx,
+                cur_quant_max_idx,
+            ) = self._get_quant_arg_indices(cur_node)
+
+            ref_quant_min = self._to_scalar(
+                self._resolve_quant_arg_value(
+                    ref_decoder, ref_node.args[ref_quant_min_idx]
+                ),
+                f"reference quant_min ({ref_node.name})",
+            )
+            cur_quant_min = self._to_scalar(
+                self._resolve_quant_arg_value(
+                    self.decoder, cur_node.args[cur_quant_min_idx]
+                ),
+                f"current quant_min ({cur_node.name})",
+            )
+            ref_quant_max = self._to_scalar(
+                self._resolve_quant_arg_value(
+                    ref_decoder, ref_node.args[ref_quant_max_idx]
+                ),
+                f"reference quant_max ({ref_node.name})",
+            )
+            cur_quant_max = self._to_scalar(
+                self._resolve_quant_arg_value(
+                    self.decoder, cur_node.args[cur_quant_max_idx]
+                ),
+                f"current quant_max ({cur_node.name})",
+            )
+            if ref_quant_min != cur_quant_min or ref_quant_max != cur_quant_max:
+                raise RuntimeError(
+                    "[SavedModelReplace] quant range mismatch at node index "
+                    f"{idx} ({cur_node.name}): "
+                    f"reference min/max=({ref_quant_min}, {ref_quant_max}) "
+                    f"current min/max=({cur_quant_min}, {cur_quant_max})"
+                )
+
+            ref_scale = self._resolve_quant_arg_value(
+                ref_decoder, ref_node.args[ref_scale_idx]
+            )
+            ref_zero_point = self._resolve_quant_arg_value(
+                ref_decoder, ref_node.args[ref_zero_point_idx]
+            )
+            self._assign_quant_arg_value(self.decoder, cur_node, cur_scale_idx, ref_scale)
+            self._assign_quant_arg_value(
+                self.decoder, cur_node, cur_zero_point_idx, ref_zero_point
+            )
+
+        self.decoder.recompile()
+        replaced_path = self._get_embedding_replaced_model_save_path()
+        replaced_dir = os.path.dirname(replaced_path)
+        if replaced_dir:
+            os.makedirs(replaced_dir, exist_ok=True)
+        replaced_ep = torch.export.export(self.decoder, self.export_input, strict=True)
+        torch.export.save(replaced_ep, replaced_path)
+        logging.info(
+            "[SavedModelReplace][%s] replaced scale/zero_point from %s (%d quant nodes), saved replaced model to %s",
+            self.mode.name,
+            ref_path,
+            len(cur_nodes),
+            replaced_path,
+        )
 
     def _save_input_kv_cache_quant_attrs(self):
         input_kv_cache_shape = {
@@ -526,7 +948,7 @@ class TextDecoder(Component):
         # Task-based calibration: Only for text-only LLMs
         # Multimodal models (VLMs) cannot use task-based evaluation currently.
         # BLENDER do not need task-based evaluation.
-        if has_task_calibration and not is_multimodal and self.mode != Mode.BLENDER:
+        if has_task_calibration and not is_multimodal:
             graph_module_inference(
                 use_kv_cache=self.meta["get_use_kv_cache"],
                 get_example_inputs=self.get_example_inputs,
@@ -644,6 +1066,15 @@ class TextDecoder(Component):
                     self.tok_embedding, text_embedding_quantizer
                 )
 
+            prepared_outputs_for_compare = None
+            prepared_final_output_tensors = None
+            if self.is_embedding:
+                prepared_outputs_for_compare = self._collect_layer_hidden_states(
+                    self.decoder
+                )
+                prepared_final_output_tensors = self._collect_output_predecessor_tensors(
+                    self.decoder, num_predecessors=0
+                )
             # start calibration
             self._calibrate(
                 model=self.decoder,
@@ -674,6 +1105,36 @@ class TextDecoder(Component):
 
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
+            
+            if prepared_outputs_for_compare is not None:
+                converted_outputs_for_compare = self._collect_layer_hidden_states(
+                    self.decoder
+                )
+                self._compare_prepared_vs_converted_by_layer(
+                    prepared_outputs_for_compare,
+                    converted_outputs_for_compare,
+                )
+            if prepared_final_output_tensors is not None:
+                converted_out_pred_tensors = self._collect_output_predecessor_tensors(
+                    self.decoder, num_predecessors=0
+                )
+                self._compare_output_and_predecessors(
+                    prepared_final_output_tensors, converted_out_pred_tensors
+                )
+            # if self.is_embedding and self.mode == Mode.PREFILL:
+            #     self._replace_quant_scale_zero_point_with_saved_embedding_reference()
+            #     self._compare_with_saved_embedding_reference()
+
+            # ppl test after quant
+            if self.mode == Mode.PREFILL or self.mode == Mode.BLENDER:
+                self._calibrate(
+                    model=self.decoder,
+                    tokenizer=data.tokenizer,
+                    event="convert_pt2e",
+                    user_calibration_data=data.calibration_data.datasets,
+                    tok_embedding=self.tok_embedding,
+                    intermediate_outputs=image_embedding,
+                )
 
             if self.control_args.verbose:
                 if self.apply_embedding:
@@ -697,7 +1158,7 @@ class TextDecoder(Component):
 
         # LLM: propagate kv cache quantization attributes for prefill model
         if not self.apply_embedding:
-            if self.mode == Mode.DECODE:
+            if not self.is_embedding and self.mode == Mode.DECODE:
                 kv_quant_attrs, output_indices = {}, 0
                 for node in self.decoder.graph.nodes:
                     if node.op == "output":
@@ -716,7 +1177,8 @@ class TextDecoder(Component):
         # MultiModal: save kv cache IO quantization attributes to requant kv cache from prefill output scale/zero_point to decode input scale/zero_point
         else:
             # save input kv cache's quantization attributes to meta
-            if self.mode == Mode.DECODE:
+            if ((not self.is_embedding and self.mode == Mode.DECODE) 
+                or (self.is_embedding and self.mode == Mode.PREFILL)):
                 self._save_input_kv_cache_quant_attrs()
 
         # setup quantized IO

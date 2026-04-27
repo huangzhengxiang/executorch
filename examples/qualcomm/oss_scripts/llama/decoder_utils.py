@@ -943,6 +943,14 @@ def kv_inference(  # noqa: C901
         result_logits = torch.cat(result_logits, dim=1)
         torch.save(result_logits, f"result_logits_{'blender' if blend_config is not None else 'default'}.pt")
         print(result_logits.shape)
+        if result_logits.shape[-1] <= tokenizer.n_words + 100:
+            # embedding model
+            logits_shape = list(result_logits.shape)
+            logits_shape[-1] = tokenizer.n_words + 100
+            placeholder_logits = torch.zeros(logits_shape, 
+                                             device=result_logits.device, dtype=result_logits.dtype)
+            placeholder_logits[..., :result_logits.shape[-1]] = result_logits
+            result_logits = placeholder_logits
     return result_logits
 
 

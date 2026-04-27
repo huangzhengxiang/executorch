@@ -766,6 +766,7 @@ class LlamaModel(nn.Module):
         self.logits_scaling = config.logits_scaling
         self.use_blend = config.use_blend
         self.blend_len = config.blend_len
+        self.is_embedding = kwargs.get("is_embedding", False)
 
         self.layers = nn.ModuleList(
             [
@@ -874,10 +875,12 @@ class LlamaModel(nn.Module):
                                           index=imp_indices.unsqueeze(-1).expand(-1, -1, self.max_context_len))
 
         hidden_states = self.norm(hidden_states)
-        logits = self.output(hidden_states)
-
-        if self.logits_scaling:
-            logits = logits / self.logits_scaling
+        if self.is_embedding:
+            logits = hidden_states
+        else:
+            logits = self.output(hidden_states)
+            if self.logits_scaling:
+                logits = logits / self.logits_scaling
 
         if self.output_cache:
             if self.use_blend:
@@ -1027,7 +1030,10 @@ class LlamaModelWithoutEmbedding(LlamaModel):
             output_v_cache.extend(v)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.output(hidden_states)
+        if self.is_embedding:
+            logits = hidden_states
+        else:
+            logits = self.output(hidden_states)
 
         if self.output_cache:
             return logits, output_k_cache, output_v_cache
@@ -1190,11 +1196,14 @@ class MultiScopeAwareLlamaModel(LlamaModel):
             output_v_cache.extend(v)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.output(hidden_states)
-        if self.final_logit_softcapping:
-            logits = logits / self.final_logit_softcapping
-            logits = torch.tanh(logits)
-            logits = logits * self.final_logit_softcapping
+        if self.is_embedding:
+            logits = hidden_states
+        else:
+            logits = self.output(hidden_states)
+            if self.final_logit_softcapping:
+                logits = logits / self.final_logit_softcapping
+                logits = torch.tanh(logits)
+                logits = logits * self.final_logit_softcapping
 
         if self.output_cache:
             return logits, output_k_cache, output_v_cache

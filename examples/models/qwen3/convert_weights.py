@@ -47,6 +47,8 @@ def qwen_3_tune_to_meta(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.
     """
     converted_state_dict = {}
     inverted_mapping_dict = {v: k for k, v in _QWEN_3_FROM_META.items()}
+    # Support Embedding model family
+    inverted_mapping_dict.update({v.replace("model.", ""): k for k,v in _QWEN_3_FROM_META.items()})
 
     for key, value in state_dict.items():
         new_key = get_mapped_key(key, inverted_mapping_dict)

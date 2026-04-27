@@ -7,6 +7,7 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/blender.h>
+#include <fstream>
 #include <numeric>
 using executorch::aten::TensorImpl;
 using executorch::runtime::EValue;
@@ -15,6 +16,19 @@ using executorch::runtime::Result;
 using executorch::runtime::Span;
 using executorch::runtime::TensorInfo;
 namespace example {
+namespace {
+void dump_last_token_embedding(
+    const std::vector<uint16_t>& embedding,
+    const char* path) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out.is_open()) {
+    return;
+  }
+  out.write(
+      reinterpret_cast<const char*>(embedding.data()),
+      embedding.size() * sizeof(uint16_t));
+}
+} // namespace
 
 template <typename T>
 BlenderPromptProcessor<T>::BlenderPromptProcessor(
@@ -242,6 +256,12 @@ const std::vector<uint16_t>& BlenderPromptProcessor<T>::get_all_logits() {
 }
 
 template <typename T>
+const std::vector<uint16_t>& BlenderPromptProcessor<T>::get_last_token_embedding()
+    const {
+  return last_token_embedding_;
+}
+
+template <typename T>
 void BlenderPromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     int64_t prompt_pos,
@@ -422,9 +442,21 @@ Result<uint64_t> BlenderPromptProcessor<T>::prefill(
     shifted_pos += metadata_.ar_len;
   }
 
+  int64_t last_token_pos = metadata_.blend_len - 1;
+  if (metadata_.is_embedding) {
+    int64_t output_dim = output_tensors_[0].size(2);
+    const uint16_t* logits_ptr = output_tensors_[0].const_data_ptr<uint16_t>();
+    const uint16_t* vec_start = logits_ptr + last_token_pos * output_dim;
+    last_token_embedding_.assign(vec_start, vec_start + output_dim);
+    dump_last_token_embedding(last_token_embedding_, "last_token_embedding_u16.bin");
+    // Simulate upserting this embedding vector into VectorDB.
+    // Call example (scale/zp come from runner metadata):
+    // vector_db.upsert(doc_id, last_token_embedding_, logits_scale, logits_zp);
+    return 0;
+  }
+
   // The last token
-  cur_token = decoder_runner_->logits_to_token(
-      output_tensors_[0], metadata_.blend_len - 1);
+  cur_token = decoder_runner_->logits_to_token(output_tensors_[0], last_token_pos);
   return cur_token;
 }
 

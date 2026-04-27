@@ -26,7 +26,9 @@
 #include <SQLiteKVStore.h>
 #include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 
 
 using executorch::extension::Module;
@@ -84,6 +86,25 @@ void save_logits(
   } else {
     ET_CHECK_MSG(false, "Error saving the dump logits file");
   }
+}
+
+std::string format_embedding_vector(
+    const std::vector<uint16_t>& embedding,
+    double scale,
+    int64_t zero_point) {
+  std::ostringstream oss;
+  oss << "[";
+  oss << std::fixed << std::setprecision(8);
+  for (size_t i = 0; i < embedding.size(); ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    const double dequantized =
+        (static_cast<int64_t>(embedding[i]) - zero_point) * scale;
+    oss << dequantized;
+  }
+  oss << "]";
+  return oss.str();
 }
 
 } // namespace
@@ -146,6 +167,8 @@ Runner<T>::Runner(
     decoder_model_version_ = DecoderModelVersion::kQwen2_5;
   } else if (decoder_model_version == "qwen3") {
     decoder_model_version_ = DecoderModelVersion::kQwen3;
+  } else if (decoder_model_version == "qwen3_embed") {
+    decoder_model_version_ = DecoderModelVersion::kQwen3Embed;
   } else if (decoder_model_version == "smollm2_135m") {
     decoder_model_version_ = DecoderModelVersion::kSmollm2_135m;
   } else if (decoder_model_version == "smollm3") {
@@ -222,6 +245,7 @@ Error Runner<T>::load() {
     eos_ids->insert(tokenizer_->encode("<|end|>", 0, 0).get()[0]);
   } else if (
       decoder_model_version_ == DecoderModelVersion::kQwen3 ||
+      decoder_model_version_ == DecoderModelVersion::kQwen3Embed ||
       decoder_model_version_ == DecoderModelVersion::kSmollm2_135m ||
       decoder_model_version_ == DecoderModelVersion::kSmollm3) {
     eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
@@ -324,7 +348,8 @@ Error Runner<T>::load() {
           vocab_size,
           use_int64_token,
           sliding_window,
-          cache_mode_});
+          cache_mode_,
+          decoder_model_version_ == DecoderModelVersion::kQwen3Embed});
   if (eval_mode_ == EvalMode::kBlend) {
     blender_prompt_processor_ = std::make_unique<BlenderPromptProcessor<T>>(
         decoder_runner_.get(),
@@ -339,7 +364,8 @@ Error Runner<T>::load() {
             vocab_size,
             use_int64_token,
             sliding_window,
-            cache_mode_});
+            cache_mode_,
+            decoder_model_version_ == DecoderModelVersion::kQwen3Embed});
   }
   if (eval_mode_ == EvalMode::kLookaheadDecoding) {
     token_generator_ = std::make_unique<LhdTokenGenerator<T>>(
@@ -428,6 +454,8 @@ Error Runner<T>::generate_from_prompt_or_file(
   }
   stats_.inference_start_ms = time_in_ms();
 
+  const bool is_embedding_model =
+      decoder_model_version_ == DecoderModelVersion::kQwen3Embed;
   int32_t seq_len = config.seq_len;
   if (attention_sink_rope_runner_ == nullptr && seq_len > context_len_) {
     ET_LOG(
@@ -446,6 +474,13 @@ Error Runner<T>::generate_from_prompt_or_file(
     seq_len = context_len_;
   }
   int32_t n_bos = (cur_pos_ == 0) ? 1 : 0;
+  int32_t n_eos = 0;
+  if (is_embedding_model) {
+    // Align embedding prompt tokenization with HF default special-token behavior:
+    // no BOS, append EOS.
+    n_bos = 0;
+    n_eos = 1;
+  }
 
   // encode the (string) prompt into tokens sequence
   std::vector<uint64_t> prompt_tokens;
@@ -470,7 +505,7 @@ Error Runner<T>::generate_from_prompt_or_file(
     }
   } else {
     tokenizers::Result<std::vector<uint64_t>> encode_res =
-        tokenizer_->encode(prompt, n_bos, 0);
+        tokenizer_->encode(prompt, n_bos, n_eos);
     ET_CHECK_TK_OK_OR_RETURN_ERROR(
         encode_res.error(), "failed to encode prompt %s", prompt.c_str());
     prompt_tokens = encode_res.get();
@@ -486,6 +521,7 @@ Error Runner<T>::generate_from_prompt_or_file(
     token_callback(prompt);
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
+  bool use_kv_store = use_kv_store_ && !is_embedding_model;
 
   // test store and load effect.
   int num_layers = kv_manager_->get_num_layers();
@@ -499,7 +535,7 @@ Error Runner<T>::generate_from_prompt_or_file(
     v_store[j] = (T*)malloc(num_heads * prompt_tokens.size() * head_dim  * sizeof(T));
   }
   bool matched = false;
-  if (use_kv_store_) {
+  if (use_kv_store) {
     // check if file exists
     matched = kv_store_->whole_matching(prompt_tokens);
     // if exists, load kv
@@ -511,7 +547,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   } 
   // prefill inference
   uint64_t cur_token;
-  if (use_kv_store_ && matched) {
+  if (use_kv_store && matched) {
     kv_store_->read_next_token(&cur_token);
   } else {
     if (eval_mode_ == EvalMode::kBlend) {
@@ -530,7 +566,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
   // store kv
-  if (use_kv_store_ && !matched) {
+  if (use_kv_store && !matched) {
     ET_LOG(
       Info,
       "Storing KV caches to disk...\n");
@@ -543,6 +579,35 @@ Error Runner<T>::generate_from_prompt_or_file(
   for (int j = 0; j < num_layers; ++j) {
     free(k_store[j]);
     free(v_store[j]);
+  }
+
+  if (is_embedding_model) {
+    const std::vector<uint16_t>& embedding_vec =
+        (eval_mode_ == EvalMode::kBlend)
+        ? blender_prompt_processor_->get_last_token_embedding()
+        : prompt_processor_->get_last_token_embedding();
+    const double logits_scale =
+        module_->method_names()->count("get_logits_scale")
+        ? ET_UNWRAP(module_->get("get_logits_scale")).toDouble()
+        : 1.0;
+    const int64_t logits_zp =
+        module_->method_names()->count("get_logits_zero_point")
+        ? ET_UNWRAP(module_->get("get_logits_zero_point")).toInt()
+        : 0;
+    // Quantized vector remains available for storage/reuse:
+    // vector_db.upsert(doc_id, embedding_vec, logits_scale, logits_zp);
+    if (token_callback) {
+      token_callback(format_embedding_vector(embedding_vec, logits_scale, logits_zp));
+    }
+    stats_.inference_end_ms = time_in_ms();
+    stats_.num_prompt_tokens = num_prompt_tokens;
+    stats_.num_generated_tokens = 0;
+    print_report(stats_);
+    print_performance_report(stats_, performance_output_path_);
+    if (stats_callback) {
+      stats_callback(stats_);
+    }
+    return Error::Ok;
   }
 
   // print the first token from prefill. No prev_token so use cur_token for

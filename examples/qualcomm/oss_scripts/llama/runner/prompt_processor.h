@@ -33,6 +33,7 @@ class PromptProcessor {
     bool use_int64_token;
     int sliding_window;
     CacheMode cache_mode;
+    bool is_embedding;
   };
   PromptProcessor(
       DecoderRunner* decoder_runner,
@@ -56,6 +57,7 @@ class PromptProcessor {
    * @return std::vector<uint16_t>& all the logits generated
    */
   virtual const std::vector<uint16_t>& get_all_logits();
+  const std::vector<uint16_t>& get_last_token_embedding() const;
 
   /**
    * Prefill an LLM Module with the given text input.
@@ -130,5 +132,6 @@ class PromptProcessor {
 
   // Unused by default, only used when dump_logits_path is provided.
   std::vector<uint16_t> prompt_all_logits_;
+  std::vector<uint16_t> last_token_embedding_;
 };
 } // namespace example
