@@ -293,7 +293,7 @@ void start_runner(
       std::move(attention_sink_rope_module));
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
-  buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
+  buf.reserve(15 * FLAGS_seq_len); // assume each token is no more than 15 chars
   std::ofstream fout(FLAGS_output_path.c_str());
   auto callback = [&](const std::string& piece) {
     for (const char c : piece) {

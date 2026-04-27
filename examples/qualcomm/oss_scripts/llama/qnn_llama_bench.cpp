@@ -84,6 +84,14 @@ DEFINE_int32(
     blend_len,
     32,
     "Blend length for BlenderMode.");
+DEFINE_bool(
+    separate_embed,
+    false,
+    "Enable separate embedding runtime path (embedding is loaded from matrix file and fed as decoder input).");
+DEFINE_string(
+    embedding_matrix_path,
+    "",
+    "Path to separate embedding matrix file (e.g. separate_embed_matrix.bin). Required when --separate_embed=true.");
 DEFINE_string(
     prefill_lengths,
     "32,128,512",
@@ -102,6 +110,22 @@ DEFINE_string(
     output_path,
     "qnn_llama_bench.csv",
     "CSV output path for benchmark results.");
+DEFINE_bool(
+    enable_embed_feature,
+    false,
+    "Run a separate embedding-only path and write vector output to --embed_output_path.");
+DEFINE_string(
+    prompt,
+    "Hello",
+    "Prompt used by --enable_embed_feature.");
+DEFINE_string(
+    embed_output_path,
+    "outputs.txt",
+    "Output path for --enable_embed_feature.");
+DEFINE_int32(
+    embed_seq_len,
+    1024,
+    "seq_len used by --enable_embed_feature.");
 
 namespace {
 
@@ -270,8 +294,8 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
       FLAGS_decoder_model_version.c_str(),
       FLAGS_model_path.c_str(),
       FLAGS_tokenizer_path.c_str(),
-      "",
       FLAGS_performance_output_path.c_str(),
+      "",
       static_cast<float>(FLAGS_temperature),
       FLAGS_eval_mode,
       FLAGS_shared_buffer,
@@ -281,6 +305,8 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
       FLAGS_kv_store,
       FLAGS_test_level,
       FLAGS_blend_len,
+      FLAGS_separate_embed,
+      FLAGS_embedding_matrix_path.c_str(),
       nullptr,
       std::move(tokenizer),
       std::move(attention_sink_rope_module));
@@ -413,12 +439,95 @@ void run_benchmarks(
   out.close();
 }
 
+template <typename T>
+void run_embed_feature() {
+  auto module = std::make_unique<executorch::extension::Module>(
+      FLAGS_model_path.c_str(),
+      executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+  std::unique_ptr<executorch::extension::Module> attention_sink_rope_module;
+  if (!FLAGS_attention_sink_rope_path.empty()) {
+    attention_sink_rope_module =
+        std::make_unique<executorch::extension::Module>(
+            FLAGS_attention_sink_rope_path.c_str(),
+            executorch::extension::Module::LoadMode::
+                MmapUseMlockIgnoreErrors);
+  }
+
+  // Keep parameter ordering aligned with qnn_llama_runner.cpp.
+  example::Runner<T> runner(
+      std::move(module),
+      FLAGS_decoder_model_version.c_str(),
+      FLAGS_model_path.c_str(),
+      FLAGS_tokenizer_path.c_str(),
+      FLAGS_performance_output_path.c_str(),
+      "",
+      static_cast<float>(FLAGS_temperature),
+      FLAGS_eval_mode,
+      FLAGS_shared_buffer,
+      FLAGS_ngram,
+      FLAGS_window,
+      FLAGS_gcap,
+      FLAGS_kv_store,
+      FLAGS_test_level,
+      FLAGS_blend_len,
+      FLAGS_separate_embed,
+      FLAGS_embedding_matrix_path.c_str(),
+      nullptr,
+      nullptr,
+      std::move(attention_sink_rope_module));
+
+  auto decoder_model_version = runner.get_decoder_model_version();
+  ET_CHECK_MSG(
+      decoder_model_version.ok(),
+      "Failed to get decoder model version");
+  ET_CHECK_MSG(
+      decoder_model_version.get() == example::DecoderModelVersion::kQwen3Embed,
+      "--enable_embed_feature currently only supports qwen3-embed model.");
+
+  std::vector<char> buf;
+  auto callback = [&](const std::string& piece) {
+    for (const char c : piece) {
+      buf.push_back(c);
+    }
+  };
+
+  executorch::extension::llm::GenerationConfig config{
+      true,
+      false,
+      -1,
+      false,
+      FLAGS_embed_seq_len,
+      static_cast<float>(FLAGS_temperature),
+      0,
+      0};
+
+  auto err = runner.generate_from_prompt_or_file(
+      FLAGS_prompt.c_str(), false, config, callback);
+  ET_CHECK_MSG(
+      err == executorch::runtime::Error::Ok,
+      "Embedding run failed with error code %d",
+      static_cast<int>(err));
+
+  std::ofstream fout(FLAGS_embed_output_path.c_str());
+  ET_CHECK_MSG(
+      fout.is_open(),
+      "Failed to open embedding output path: %s",
+      FLAGS_embed_output_path.c_str());
+  fout.write(buf.data(), buf.size());
+  fout.close();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   ET_CHECK_MSG(FLAGS_num_iters > 0, "--num_iters must be > 0");
   ET_CHECK_MSG(FLAGS_warmup_iters >= 0, "--warmup_iters must be >= 0");
+  if (FLAGS_separate_embed && FLAGS_embedding_matrix_path.empty()) {
+    ET_CHECK_MSG(
+        false,
+        "--embedding_matrix_path must be provided when --separate_embed=true.");
+  }
   ET_CHECK_MSG(FLAGS_dummy_token_id <= std::numeric_limits<int32_t>::max(),
       "--dummy_token_id must fit int32 for models with int32 token input");
 
@@ -434,6 +543,21 @@ int main(int argc, char** argv) {
   if (module->method_names()->count("get_kv_io_bit_width") > 0) {
     kv_bitwidth = static_cast<example::KvBitWidth>(
         module->get("get_kv_io_bit_width").get().toScalar().to<int64_t>());
+  }
+
+  if (FLAGS_enable_embed_feature) {
+    ET_CHECK_MSG(FLAGS_embed_seq_len > 0, "--embed_seq_len must be > 0");
+    if (kv_bitwidth == example::KvBitWidth::kWidth8) {
+      run_embed_feature<uint8_t>();
+    } else if (kv_bitwidth == example::KvBitWidth::kWidth16) {
+      run_embed_feature<uint16_t>();
+    } else {
+      ET_CHECK_MSG(
+          false,
+          "Unsupported kv bitwidth: %ld",
+          static_cast<int64_t>(kv_bitwidth));
+    }
+    return 0;
   }
 
   if (kv_bitwidth == example::KvBitWidth::kWidth8) {
