@@ -8,6 +8,7 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
 #include <fstream>
+#include <cstring>
 #include <numeric>
 using executorch::aten::TensorImpl;
 using executorch::runtime::EValue;
@@ -45,7 +46,21 @@ PromptProcessor<T>::PromptProcessor(
   k_cache_out_.resize(metadata_.num_layers);
   v_cache_out_.resize(metadata_.num_layers);
   // Calculate I/O size
-  input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        metadata_.separate_embedding != nullptr,
+        "Separate embedding instance is required when use_separate_embed is true.");
+    ET_CHECK_MSG(
+        metadata_.embedding_input_elem_size > 0,
+        "embedding_input_elem_size must be set when use_separate_embed is true.");
+    input_toks_.size = 0;
+    input_embedding_.size = static_cast<size_t>(metadata_.ar_len) *
+        static_cast<size_t>(metadata_.embedding_dim) *
+        metadata_.embedding_input_elem_size;
+  } else {
+    input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+    input_embedding_.size = 0;
+  }
   if (is_bert())
     input_pos_.size = 0;
   else
@@ -77,19 +92,33 @@ void PromptProcessor<T>::init_io(
   size_t idx = 0;
   input_tensors_.reserve(method_meta->num_inputs());
   output_tensors_.reserve(method_meta->num_outputs());
-  // [I]: input_tokens
-  Result<TensorInfo> input_toks = method_meta->input_tensor_meta(idx++);
-  input_toks_.data =
-      reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
-  input_toks_.tensor = std::make_unique<TensorImpl>(
-      input_toks->scalar_type(),
-      input_toks->sizes().size(),
-      const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
-      input_toks_.data,
-      const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
-  input_tensors_.emplace_back(input_toks_.tensor.get());
-  buffer_manager->add_memory_info(
-      input_toks_.data, input_toks_.size, input_toks.get());
+  // [I]: input_tokens or input_embedding
+  Result<TensorInfo> first_input = method_meta->input_tensor_meta(idx++);
+  if (metadata_.use_separate_embed) {
+    input_embedding_.data = reinterpret_cast<uint8_t*>(
+        buffer_manager->allocate(input_embedding_.size));
+    input_embedding_.tensor = std::make_unique<TensorImpl>(
+        first_input->scalar_type(),
+        first_input->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(first_input->sizes().data()),
+        input_embedding_.data,
+        const_cast<TensorImpl::DimOrderType*>(first_input->dim_order().data()));
+    input_tensors_.emplace_back(input_embedding_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_embedding_.data, input_embedding_.size, first_input.get());
+  } else {
+    input_toks_.data =
+        reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
+    input_toks_.tensor = std::make_unique<TensorImpl>(
+        first_input->scalar_type(),
+        first_input->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(first_input->sizes().data()),
+        input_toks_.data,
+        const_cast<TensorImpl::DimOrderType*>(first_input->dim_order().data()));
+    input_tensors_.emplace_back(input_toks_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_toks_.data, input_toks_.size, first_input.get());
+  }
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
@@ -238,15 +267,46 @@ void PromptProcessor<T>::prepare_io(
 
     // Prepare input token data
     if (prompt_pos + i < prompt_tokens.size()) {
-      // Support CPU 4-bit embedding, which requires int64 input.
-      // However, for QNN embedding, only int32 input is needed.
-      // Therefore, we need to cast to the correct type to write the data.
-      if (metadata_.use_int64_token) {
-        input_toks_.data[i] = prompt_tokens[prompt_pos + i];
+      if (metadata_.use_separate_embed) {
+        ET_CHECK_MSG(
+            metadata_.separate_embedding != nullptr,
+            "Separate embedding lookup is not initialized.");
+        const size_t out_row_bytes = static_cast<size_t>(metadata_.embedding_dim) *
+            metadata_.embedding_input_elem_size;
+        uint8_t* out_row = input_embedding_.data + i * out_row_bytes;
+        if (metadata_.dequantize_separate_embed_to_fp32) {
+          ET_CHECK_MSG(
+              metadata_.embedding_input_elem_size == sizeof(float),
+              "dequantize_separate_embed_to_fp32 requires float input row.");
+          metadata_.separate_embedding->dequantize_row_to_float(
+              prompt_tokens[prompt_pos + i],
+              reinterpret_cast<float*>(out_row),
+              static_cast<size_t>(metadata_.embedding_dim));
+        } else {
+          metadata_.separate_embedding->copy_row(
+              prompt_tokens[prompt_pos + i],
+              out_row,
+              out_row_bytes);
+        }
       } else {
-        int32_t* input_toks_ptr = reinterpret_cast<int32_t*>(input_toks_.data);
-        input_toks_ptr[i] = static_cast<int32_t>(prompt_tokens[prompt_pos + i]);
+        // Support CPU 4-bit embedding, which requires int64 input.
+        // However, for QNN embedding, only int32 input is needed.
+        // Therefore, we need to cast to the correct type to write the data.
+        if (metadata_.use_int64_token) {
+          input_toks_.data[i] = prompt_tokens[prompt_pos + i];
+        } else {
+          int32_t* input_toks_ptr = reinterpret_cast<int32_t*>(input_toks_.data);
+          input_toks_ptr[i] =
+              static_cast<int32_t>(prompt_tokens[prompt_pos + i]);
+        }
       }
+    } else if (metadata_.use_separate_embed) {
+      const size_t out_row_bytes = static_cast<size_t>(metadata_.embedding_dim) *
+          metadata_.embedding_input_elem_size;
+      std::memset(
+          input_embedding_.data + i * out_row_bytes,
+          0,
+          out_row_bytes);
     }
   }
 }

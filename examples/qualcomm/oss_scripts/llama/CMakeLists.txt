@@ -47,6 +47,8 @@ list(
   ${CMAKE_CURRENT_LIST_DIR}/runner/rpc_mem.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/kv_manager.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/kv_manager.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/separate_embed.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/separate_embed.h
   ${EXECUTORCH_SOURCE_DIR}/examples/models/llama/runner/runner.cpp
   ${EXECUTORCH_SOURCE_DIR}/examples/models/llama/runner/runner.h
 )
@@ -164,6 +166,8 @@ list(APPEND _multimodal_runner__srcs)
 add_executable(qnn_multimodal_runner ${_multimodal_runner__srcs})
 target_include_directories(
   qnn_multimodal_runner PUBLIC ${_common_include_directories}
+                               ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/include/
+                               ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/  
 )
 target_include_directories(
   qnn_multimodal_runner
@@ -185,6 +189,7 @@ target_link_libraries(
   quantized_ops_lib
   quantized_kernels
   tokenizers::tokenizers
+  LMStore
 )
 
 set_target_properties(

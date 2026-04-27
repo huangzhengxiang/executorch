@@ -39,7 +39,21 @@ TokenGenerator<T>::TokenGenerator(
   v_cache_out_.resize(metadata_.num_layers);
 
   // Calculate I/O size
-  input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        metadata_.separate_embedding != nullptr,
+        "Separate embedding instance is required when use_separate_embed is true.");
+    ET_CHECK_MSG(
+        metadata_.embedding_input_elem_size > 0,
+        "embedding_input_elem_size must be set when use_separate_embed is true.");
+    input_toks_.size = 0;
+    input_embedding_.size = static_cast<size_t>(metadata_.ar_len) *
+        static_cast<size_t>(metadata_.embedding_dim) *
+        metadata_.embedding_input_elem_size;
+  } else {
+    input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+    input_embedding_.size = 0;
+  }
   input_pos_.size = metadata_.ar_len * sizeof(int32_t);
   attention_mask_.size =
       metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
@@ -70,19 +84,33 @@ void TokenGenerator<T>::init_io(
   size_t idx = 0;
   input_tensors_.reserve(method_meta->num_inputs());
   output_tensors_.reserve(method_meta->num_outputs());
-  // [I]: input_tokens
-  Result<TensorInfo> input_toks = method_meta->input_tensor_meta(idx++);
-  input_toks_.data =
-      reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
-  input_toks_.tensor = std::make_unique<TensorImpl>(
-      input_toks->scalar_type(),
-      input_toks->sizes().size(),
-      const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
-      input_toks_.data,
-      const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
-  input_tensors_.emplace_back(input_toks_.tensor.get());
-  buffer_manager->add_memory_info(
-      input_toks_.data, input_toks_.size, input_toks.get());
+  // [I]: input_tokens or input_embedding
+  Result<TensorInfo> first_input = method_meta->input_tensor_meta(idx++);
+  if (metadata_.use_separate_embed) {
+    input_embedding_.data = reinterpret_cast<uint8_t*>(
+        buffer_manager->allocate(input_embedding_.size));
+    input_embedding_.tensor = std::make_unique<TensorImpl>(
+        first_input->scalar_type(),
+        first_input->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(first_input->sizes().data()),
+        input_embedding_.data,
+        const_cast<TensorImpl::DimOrderType*>(first_input->dim_order().data()));
+    input_tensors_.emplace_back(input_embedding_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_embedding_.data, input_embedding_.size, first_input.get());
+  } else {
+    input_toks_.data =
+        reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
+    input_toks_.tensor = std::make_unique<TensorImpl>(
+        first_input->scalar_type(),
+        first_input->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(first_input->sizes().data()),
+        input_toks_.data,
+        const_cast<TensorImpl::DimOrderType*>(first_input->dim_order().data()));
+    input_tensors_.emplace_back(input_toks_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_toks_.data, input_toks_.size, first_input.get());
+  }
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
@@ -212,9 +240,35 @@ const std::vector<uint16_t>& TokenGenerator<T>::get_all_logits() {
 // This function only considers the case where token_generator_ar_len equals 1.
 template <typename T>
 void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos) {
-  // update input_tok
-  *input_toks_.data =
-      metadata_.use_int64_token ? cur_token : static_cast<int32_t>(cur_token);
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        metadata_.separate_embedding != nullptr,
+        "Separate embedding lookup is not initialized.");
+    const size_t out_row_bytes = static_cast<size_t>(metadata_.embedding_dim) *
+        metadata_.embedding_input_elem_size;
+    if (metadata_.dequantize_separate_embed_to_fp32) {
+      ET_CHECK_MSG(
+          metadata_.embedding_input_elem_size == sizeof(float),
+          "dequantize_separate_embed_to_fp32 requires float input row.");
+      metadata_.separate_embedding->dequantize_row_to_float(
+          cur_token,
+          reinterpret_cast<float*>(input_embedding_.data),
+          static_cast<size_t>(metadata_.embedding_dim));
+    } else {
+      metadata_.separate_embedding->copy_row(
+          cur_token,
+          input_embedding_.data,
+          out_row_bytes);
+    }
+  } else {
+    // update input_tok
+    if (metadata_.use_int64_token) {
+      *input_toks_.data = cur_token;
+    } else {
+      int32_t* input_toks_ptr = reinterpret_cast<int32_t*>(input_toks_.data);
+      input_toks_ptr[0] = static_cast<int32_t>(cur_token);
+    }
+  }
   // update position_ids
   *input_pos_.data = static_cast<int32_t>(start_pos);
 }

@@ -447,7 +447,7 @@ class Qwen2_5_1_5B(LLMModelConfig):
 @register_llm_model("qwen3-0_6b")
 @dataclass(init=False, frozen=True)
 class Qwen3_0_6B(LLMModelConfig):
-    repo_id: str = "Qwen/Qwen3-0.6B"
+    repo_id: str = "/root/autodl-tmp/model/Qwen3-0.6B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3/config/0_6b_config.json"
     )
@@ -456,7 +456,7 @@ class Qwen3_0_6B(LLMModelConfig):
     instruct_model = True
     num_sharding = 1
     masked_softmax = True
-    seq_mse_candidates = 1000
+    seq_mse_candidates = 0
     r1 = False
     r2 = False
     r3 = False

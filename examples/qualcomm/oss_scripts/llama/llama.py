@@ -34,6 +34,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     DECODER_GRAPH_NAMES,
     EVAL_MODE,
     PROMPT_EVAL,
+    SEPARATE_EMBED_INFO_FILENAME,
+    SEPARATE_EMBED_MATRIX_FILENAME,
     SQNR_EVAL,
     TASKS_EVAL,
     TEXT_DECODER,
@@ -489,6 +491,11 @@ def _build_parser():
         default=None,
         type=str,
     )
+    parser.add_argument(
+        "--separate_embed",
+        action="store_true",
+        help="Experimental: split token embedding from decoder by rewriting decoder input to hidden_states before lowering. Current support is compile-only.",
+    )
 
     parser.add_argument(
         "--eval_methods",
@@ -547,6 +554,18 @@ def export_llama(args) -> None:
     ), f"Unknown decoder_model: {args.decoder_model}."
     decoder_model_config = SUPPORTED_LLM_MODELS[args.decoder_model]
     logging.info(f"*** {args.decoder_model} ***\n%s", str(decoder_model_config))
+
+    if args.separate_embed and (
+        hasattr(decoder_model_config, VISION_ENCODER)
+        or hasattr(decoder_model_config, AUDIO_ENCODER)
+    ):
+        raise RuntimeError(
+            "--separate_embed currently supports text-only models only."
+        )
+    if args.separate_embed and not args.compile_only:
+        raise RuntimeError(
+            "--separate_embed is currently compile-only. Please pass --compile_only for now."
+        )
 
     if args.max_context_len is None:
         args.max_context_len = args.max_seq_len
@@ -670,6 +689,12 @@ def export_llama(args) -> None:
         tokenizer,
         calibration_data,
     )
+    if args.separate_embed:
+        logging.info(
+            "Separate embedding artifacts generated at %s and %s",
+            f"{args.artifact}/{SEPARATE_EMBED_INFO_FILENAME}",
+            f"{args.artifact}/{SEPARATE_EMBED_MATRIX_FILENAME}",
+        )
     if args.use_attention_sink:
         compile_attention_sink_evictor(
             args,

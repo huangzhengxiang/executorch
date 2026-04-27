@@ -12,7 +12,9 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/separate_embed.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -34,6 +36,11 @@ class PromptProcessor {
     int sliding_window;
     CacheMode cache_mode;
     bool is_embedding;
+    bool use_separate_embed{false};
+    int32_t embedding_dim{0};
+    size_t embedding_input_elem_size{0};
+    bool dequantize_separate_embed_to_fp32{false};
+    const SeparateEmbedding* separate_embedding{nullptr};
   };
   PromptProcessor(
       DecoderRunner* decoder_runner,
@@ -80,10 +87,10 @@ class PromptProcessor {
    */
   inline const size_t total_prompt_processor_io_size_in_bytes() const {
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
+      return input_toks_.size + input_embedding_.size + input_pos_.size + attention_mask_.size +
           window_attention_mask_.size + logits_.size;
     } else {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
+      return input_toks_.size + input_embedding_.size + input_pos_.size + attention_mask_.size +
           logits_.size;
     }
   }
@@ -113,6 +120,7 @@ class PromptProcessor {
 
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
+  TensorStruct<uint8_t> input_embedding_;
   TensorStruct<int32_t> input_pos_;
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;
