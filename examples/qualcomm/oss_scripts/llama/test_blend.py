@@ -840,6 +840,8 @@ def test(args):
     decoder_model_config = SUPPORTED_LLM_MODELS[args.decoder_model]
     if args.max_context_len is None:
         args.max_context_len = args.max_seq_len
+    if args.blender_ar_len is None:
+        args.blender_ar_len = args.prefill_ar_len
     print(decoder_model_config)
     print(args.decoder_model)
     # Prepare tokenizer
@@ -876,20 +878,3 @@ if __name__ == "__main__":
         parser = _build_parser()
         args = parser.parse_args()
         test(args)
-        
-    if False:
-        # blend_kv unit test
-        B, H, S, D = 1, 8, 1024, 128
-        store_kv(torch.arange(12), 0, [torch.ones(B,H,D,S)], [torch.ones(B,H,S,D)])
-        store_kv(torch.tensor([0,1,2,17,18,19,20,21,8,9,11]), 0, [torch.ones(B,H,D,S)], [torch.ones(B,H,S,D)])
-        store_kv(torch.tensor([0,1,2,12,13,14,15,16,8,9,11]), 0, [torch.ones(B,H,D,S)], [torch.ones(B,H,S,D)])
-        freqs_cos, freqs_sin = torch.ones(S, D//2)*0.6, torch.ones(S, D//2)*0.8
-        mock_inputs = torch.tensor([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,8,9,17,18,19,20,21,8,9,11])
-        
-        print("\nUnit Test: load_kv...")
-        matched_kv = load_kv(mock_inputs, 0, freqs_cos, freqs_sin)
-        print(matched_kv)
-
-        print("\nUnit Test: load_kv...")
-        inputs_kv = blend_kv(mock_inputs, 0, freqs_cos, freqs_sin, use_blend=True)
-        print(inputs_kv)
