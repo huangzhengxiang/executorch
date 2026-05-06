@@ -84,6 +84,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.wrappers.base_component impo
     is_node_src_start_with_name,
     log_info,
     Mode,
+    next_power_of_two,
     process_model_args,
     Processor,
     Request,
@@ -328,6 +329,24 @@ class TextDecoder(Component):
         )
 
         self.meta = decoder.get_metadata()
+        prefill_ar_len = getattr(self.control_args, "prefill_ar_len", 1)
+        blender_ar_len = getattr(self.control_args, "blender_ar_len", prefill_ar_len)
+        if blender_ar_len is None:
+            blender_ar_len = prefill_ar_len
+        decode_ar_len = (
+            next_power_of_two(
+                (self.control_args.window + self.control_args.gcap)
+                * (self.control_args.ngram - 1)
+            )
+            if self.control_args.model_mode == "lookahead"
+            else 1
+        )
+        self.meta["get_max_ar_len"] = max(
+            self.meta.get("get_ar_len", 1),
+            decode_ar_len,
+            prefill_ar_len,
+            blender_ar_len,
+        )
         # get example input
         self.example_input = decoder.get_example_inputs()
         self.get_example_inputs = decoder.get_example_inputs
@@ -957,6 +976,7 @@ class TextDecoder(Component):
                 get_example_inputs=self.get_example_inputs,
                 module=model,
                 tokenizer=tokenizer,
+                max_ar_len=self.meta["get_max_ar_len"],
                 ar_len=self.meta["get_ar_len"],
                 max_seq_len=self.meta["get_max_context_len"],
                 tasks=self.control_args.tasks,
@@ -990,6 +1010,7 @@ class TextDecoder(Component):
                     "modality_placeholder_token_id", None
                 ),
                 tokenizer=tokenizer,
+                max_ar_len=self.meta["get_max_ar_len"],
                 ar_len=self.meta["get_ar_len"],
                 max_seq_len=self.meta["get_max_context_len"],
                 prompt=prompt,

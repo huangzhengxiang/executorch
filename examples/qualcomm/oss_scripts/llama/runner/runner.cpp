@@ -22,14 +22,21 @@
 #include <executorch/runtime/platform/log.h>
 #include <pytorch/tokenizers/hf_tokenizer.h>
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
+#include <ops/ops.h>
 #include <NaiveKVStore.h>
+#include <RopeConfigParser.h>
 #include <SQLiteKVStore.h>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <sstream>
 #include <limits>
+#include <mutex>
+#include <sstream>
+#include <thread>
 #include <type_traits>
 
 
@@ -195,8 +202,11 @@ Runner<T>::Runner(
     const bool use_kv_store,
     const int test_level,
     const int blend_len,
+    const float latency_ratio,
+    const float recompute_ratio,
     const bool separate_embed,
     const std::string& embedding_matrix_path,
+    const std::string& rope_config_path,
     torch::executor::EventTracer* event_tracer,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
@@ -207,9 +217,13 @@ Runner<T>::Runner(
       use_kv_store_(use_kv_store),
       test_level_(test_level),
       blend_len_(blend_len),
+      latency_ratio_(latency_ratio),
+      recompute_ratio_(recompute_ratio),
       separate_embed_(separate_embed),
       embedding_matrix_path_(embedding_matrix_path),
+      rope_config_path_(rope_config_path),
       tokenizer_path_(tokenizer_path),
+      model_path_(model_path),
       performance_output_path_(performance_output_path),
       dump_logits_path_(dump_logits_path),
       temperature_(temperature),
@@ -259,6 +273,43 @@ Runner<T>::Runner(
   ET_LOG(Info, "eval mode=%d", eval_mode_);
 }
 
+namespace {
+const char* decoder_model_version_to_string(DecoderModelVersion version) {
+  switch (version) {
+    case DecoderModelVersion::kLlama2:
+      return "llama2";
+    case DecoderModelVersion::kLlama3:
+      return "llama3";
+    case DecoderModelVersion::kGemma:
+      return "gemma";
+    case DecoderModelVersion::kGemma3:
+      return "gemma3";
+    case DecoderModelVersion::kGranite:
+      return "granite";
+    case DecoderModelVersion::kPhi4:
+      return "phi4";
+    case DecoderModelVersion::kQwen2_5:
+      return "qwen2_5";
+    case DecoderModelVersion::kQwen3:
+      return "qwen3";
+    case DecoderModelVersion::kQwen3Embed:
+      return "qwen3_embed";
+    case DecoderModelVersion::kSmollm2_135m:
+      return "smollm2_135m";
+    case DecoderModelVersion::kSmollm3:
+      return "smollm3";
+    case DecoderModelVersion::kCodegen:
+      return "codegen";
+    case DecoderModelVersion::kGlm:
+      return "glm";
+    case DecoderModelVersion::kGemma2:
+      return "gemma2";
+    default:
+      return "unknown";
+  }
+}
+} // namespace
+
 template <typename T>
 bool Runner<T>::is_loaded() const {
   const bool separate_embed_ready =
@@ -266,6 +317,69 @@ bool Runner<T>::is_loaded() const {
   return module_->is_loaded() && tokenizer_ && decoder_runner_ &&
       prompt_processor_ && token_generator_ && kv_manager_ && buffer_manager_ &&
       separate_embed_ready;
+}
+
+template <typename T>
+Error Runner<T>::maybe_initialize_rope_freqs(int32_t seq_len) {
+  if (rope_config_path_.empty() || seq_len <= 0) {
+    return Error::Ok;
+  }
+
+  if (rope_head_dim_ <= 0) {
+    ET_LOG(
+        Error,
+        "Invalid RoPE head_dim (%d) for config path %s",
+        rope_head_dim_,
+        rope_config_path_.c_str());
+    return Error::Internal;
+  }
+
+  const int32_t half_dim = rope_head_dim_ / 2;
+  ET_CHECK_MSG(
+      half_dim > 0, "Invalid RoPE half_dim computed from %d", rope_head_dim_);
+
+  const size_t expected_size =
+      static_cast<size_t>(seq_len) * static_cast<size_t>(half_dim);
+  if (
+      rope_freqs_seq_len_ == seq_len &&
+      rope_freqs_cos_.size() == expected_size &&
+      rope_freqs_sin_.size() == expected_size)
+  {
+    return Error::Ok;
+  }
+
+  LMStore::rope_config_params cfg;
+  std::string err_msg;
+  if (!LMStore::parse_rope_config_json_file(
+          rope_config_path_, &cfg, &err_msg)) {
+    ET_LOG(
+        Error,
+        "Failed to parse RoPE config from %s: %s",
+        rope_config_path_.c_str(),
+        err_msg.c_str());
+    return Error::Internal;
+  }
+
+  ET_CHECK_MSG(
+      cfg.head_dim == rope_head_dim_,
+      "RoPE head_dim mismatch: model=%d json=%d path=%s",
+      rope_head_dim_,
+      cfg.head_dim,
+      rope_config_path_.c_str());
+
+  rope_freqs_cos_.resize(expected_size);
+  rope_freqs_sin_.resize(expected_size);
+  LMStore::precompute_rope_freqs_cis(
+      rope_freqs_cos_.data(), rope_freqs_sin_.data(), seq_len, cfg);
+  rope_freqs_seq_len_ = seq_len;
+
+  ET_LOG(
+      Info,
+      "Initialized RoPE freqs_cos/freqs_sin with seq_len=%d head_dim=%d from %s",
+      seq_len,
+      cfg.head_dim,
+      rope_config_path_.c_str());
+  return Error::Ok;
 }
 
 template <typename T>
@@ -364,6 +478,11 @@ Error Runner<T>::load() {
   auto k_cache_shape = method_meta->output_tensor_meta(1)->sizes();
   int64_t num_heads = k_cache_shape[1];
   int64_t head_dim = k_cache_shape[2];
+  ET_CHECK_MSG(
+      head_dim <= std::numeric_limits<int32_t>::max(),
+      "head_dim is too large: %ld",
+      head_dim);
+  rope_head_dim_ = static_cast<int32_t>(head_dim);
   if (separate_embed_ && eval_mode_ == EvalMode::kLookaheadDecoding) {
     ET_LOG(Error, "separate_embed currently does not support lookahead mode.");
     return Error::Internal;
@@ -443,6 +562,7 @@ Error Runner<T>::load() {
   // Use attention mask length to retrieve AR length and context length
   // Cache len equals to context_len - ar_len
   int32_t prompt_processor_ar_len = 0;
+  int32_t blender_prompt_processor_ar_len = 0;
   int32_t token_generator_ar_len = 0;
   int32_t max_cache_len = 0;
   int32_t max_ar_len = 0;
@@ -461,6 +581,32 @@ Error Runner<T>::load() {
             ->input_tensor_meta(1);
     prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[1];
   }
+  if (eval_mode_ == EvalMode::kBlend) {
+    auto atten_mask_meta_blender =
+        module_->method_meta(blender_method_name)->input_tensor_meta(1);
+    blender_prompt_processor_ar_len = atten_mask_meta_blender->sizes()[1];
+  }
+  prompt_processor_ar_len_ = prompt_processor_ar_len;
+  blender_prompt_processor_ar_len_ = blender_prompt_processor_ar_len;
+  int32_t blend_len = blend_len_;
+  if (eval_mode_ == EvalMode::kBlend) {
+    auto blender_method_meta = module_->method_meta(blender_method_name);
+    ET_CHECK_MSG(
+        blender_method_meta->num_outputs() > 0,
+        "Blender method must have at least one output tensor.");
+    auto imp_indices_meta =
+        blender_method_meta->output_tensor_meta(
+            blender_method_meta->num_outputs() - 1);
+    ET_CHECK_MSG(
+        !imp_indices_meta->sizes().empty(),
+        "Blender imp_indices tensor must have at least one dimension.");
+    blend_len =
+        imp_indices_meta->sizes()[imp_indices_meta->sizes().size() - 1];
+    ET_CHECK_MSG(
+        blend_len > 0,
+        "Invalid blend_len inferred from blender output tensor: %d",
+        blend_len);
+  }
   if (prompt_processor_ar_len == context_len_)
     max_cache_len = context_len_;
   else
@@ -468,6 +614,9 @@ Error Runner<T>::load() {
         std::min(token_generator_ar_len, prompt_processor_ar_len);
   if (eval_mode_ == EvalMode::kBlend) { max_cache_len = context_len_; }
   max_ar_len = std::max(token_generator_ar_len, prompt_processor_ar_len);
+  if (eval_mode_ == EvalMode::kBlend) {
+    max_ar_len = std::max(max_ar_len, blender_prompt_processor_ar_len);
+  }
 
   // Load the sliding window size if the model supports it.
   // This is used to configure the attention mask for models with window
@@ -519,8 +668,8 @@ Error Runner<T>::load() {
             context_len_,
             num_heads,
             num_layers,
-            prompt_processor_ar_len,
-            blend_len_,
+            blender_prompt_processor_ar_len,
+            blend_len,
             vocab_size,
             use_int64_token,
             sliding_window,
@@ -579,14 +728,24 @@ Error Runner<T>::load() {
   // TODO: currently blender doesn't support shared buffer.
   buffer_manager_ = std::make_unique<ClientMem>();
   if (shared_buffer_) {
+    size_t prompt_processor_io_size =
+        prompt_processor_->total_prompt_processor_io_size_in_bytes();
+    if (eval_mode_ == EvalMode::kBlend) {
+      prompt_processor_io_size = std::max(
+          prompt_processor_io_size,
+          blender_prompt_processor_->total_prompt_processor_io_size_in_bytes());
+    }
     buffer_manager_ = std::make_unique<RpcMem>(
         kv_manager_->total_cache_size_in_bytes(),
-        prompt_processor_->total_prompt_processor_io_size_in_bytes(),
+        prompt_processor_io_size,
         token_generator_->total_token_generator_io_size_in_bytes());
   }
   ET_LOG(Info, "creating io_memory");
   // prepare io
-  kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len);
+  kv_manager_->init_cache(
+      buffer_manager_.get(),
+      eval_mode_ == EvalMode::kBlend ? blender_prompt_processor_ar_len
+                                     : prompt_processor_ar_len);
   prompt_processor_->init_io(
       buffer_manager_.get(),
       module_->method_meta(prompt_processor_method_name));
@@ -732,6 +891,7 @@ Error Runner<T>::generate_from_prompt_or_file(
         context_len_);
     seq_len = context_len_;
   }
+  ET_CHECK_OK_OR_RETURN_ERROR(maybe_initialize_rope_freqs(seq_len));
   int32_t n_bos = (cur_pos_ == 0) ? 1 : 0;
   int32_t n_eos = 0;
   if (is_embedding_model) {
@@ -780,48 +940,308 @@ Error Runner<T>::generate_from_prompt_or_file(
     token_callback(prompt);
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
-  bool use_kv_store = use_kv_store_ && !is_embedding_model;
+  bool use_kv_store =
+      use_kv_store_ && !is_embedding_model && eval_mode_ == EvalMode::kBlend;
 
   // test store and load effect.
   int num_layers = kv_manager_->get_num_layers();
   int num_heads = kv_manager_->get_num_heads();
   int head_dim = kv_manager_->get_head_dim();
-  kv_store_ = std::make_unique<LMStore::SQLiteKVStore<T>>("qwen3-1.7b-000.bin",
-      num_layers, num_heads, head_dim, prompt_tokens.size());
+  const size_t model_path_hash = std::hash<std::string>{}(model_path_);
+  std::ostringstream kv_store_name;
+  kv_store_name << decoder_model_version_to_string(decoder_model_version_)
+                << "-" << std::hex << model_path_hash << ".bin";
+  kv_store_ = std::make_unique<LMStore::SQLiteKVStore<T>>(
+      kv_store_name.str(), num_layers, num_heads, head_dim, prompt_tokens.size());
   std::vector<T*> k_store(num_layers, nullptr), v_store(num_layers, nullptr);
   for (int j = 0; j < num_layers; ++j) {
     k_store[j] = (T*)malloc(num_heads * head_dim * prompt_tokens.size() * sizeof(T));
     v_store[j] = (T*)malloc(num_heads * prompt_tokens.size() * head_dim  * sizeof(T));
   }
+  uint64_t cur_token = 0;
   bool matched = false;
-  if (use_kv_store) {
-    // check if file exists
-    matched = kv_store_->whole_matching(prompt_tokens);
-    // if exists, load kv
-    if (matched) {
-      kv_store_->transfer_cache(k_store, v_store, false);
-      kv_manager_->transfer_cache(k_store, v_store, prompt_tokens.size(),
-          prompt_tokens.size(), prompt_tokens.size(), false);
+  int64_t ori_pos = cur_pos_;
+  if (use_kv_store && eval_mode_ == EvalMode::kBlend) {
+    const int32_t selective_recompute_budget =
+        (eval_mode_ == EvalMode::kBlend && blender_prompt_processor_ar_len_ > 0)
+        ? blender_prompt_processor_ar_len_
+        : prompt_processor_ar_len_;
+    const int32_t prompt_budget =
+        prompt_processor_ar_len_ > 0 ? prompt_processor_ar_len_
+                                     : static_cast<int32_t>(prompt_tokens.size());
+    const auto build_input_result = kv_store_->build_input(
+        prompt_tokens,
+        cur_pos_,
+        16,
+        selective_recompute_budget,
+        prompt_budget,
+        latency_ratio_,
+        recompute_ratio_);
+    ET_LOG(
+        Info,
+        "build_input: cur_pos=%lld prompt_len=%zu selective_recompute_budget=%d prompt_budget=%d raw_matches=%zu segments=%zu merge_chunks=%zu recipes=%zu",
+        static_cast<long long>(cur_pos_),
+        prompt_tokens.size(),
+        selective_recompute_budget,
+        prompt_budget,
+        build_input_result.raw_matches.size(),
+        build_input_result.segments.size(),
+        build_input_result.merge_result.chunks.size(),
+        build_input_result.recipes.size());
+    for (size_t i = 0; i < build_input_result.raw_matches.size(); ++i) {
+      const auto& match = build_input_result.raw_matches[i];
+      ET_LOG(
+          Info,
+          "build_input raw_match[%zu]: row_id=%d cur_start=%d ori_start=%d len=%d type=%d",
+          i,
+          match.row_id,
+          match.cur_start_pos,
+          match.ori_start_pos,
+          match.matched_len,
+          static_cast<int>(match.type));
     }
-  } 
-  // prefill inference
-  uint64_t cur_token;
-  if (use_kv_store && matched) {
-    kv_store_->read_next_token(&cur_token);
+    for (size_t i = 0; i < build_input_result.segments.size(); ++i) {
+      const auto& seg = build_input_result.segments[i];
+      ET_LOG(
+          Info,
+          "build_input segment[%zu]: row_id=%d cur_start=%d ori_start=%d len=%d type=%d",
+          i,
+          seg.row_id,
+          seg.cur_start_pos,
+          seg.ori_start_pos,
+          seg.matched_len,
+          static_cast<int>(seg.type));
+    }
+    for (size_t i = 0; i < build_input_result.merge_result.chunks.size(); ++i) {
+      ET_LOG(
+          Info,
+          "build_input merge_chunk[%zu]: start=%d end=%d graph_type=%d",
+          i,
+          build_input_result.merge_result.chunks[i].start,
+          build_input_result.merge_result.chunks[i].end,
+          static_cast<int>(build_input_result.merge_result.groups[i]));
+    }
+    for (size_t i = 0; i < build_input_result.recipes.size(); ++i) {
+      const auto& recipe = build_input_result.recipes[i];
+      ET_LOG(
+          Info,
+          "build_input recipe[%zu]: start=%d end=%d graph_type=%d origins=%zu",
+          i,
+          recipe.start,
+          recipe.end,
+          static_cast<int>(recipe.group),
+          recipe.origins.size());
+      for (size_t j = 0; j < recipe.origins.size(); ++j) {
+        const auto& origin = recipe.origins[j];
+        ET_LOG(
+            Info,
+            "build_input recipe[%zu].origin[%zu]: row_id=%d cur_start=%d ori_start=%d len=%d type=%d",
+            i,
+            j,
+            origin.row_id,
+            origin.cur_start_pos,
+            origin.ori_start_pos,
+            origin.matched_len,
+            static_cast<int>(origin.type));
+      }
+    }
+
+    auto rerotate_origin_slice =
+        [&](const LMStore::RecipeOrigin& origin, int64_t source_ori_pos) {
+          if constexpr (std::is_same<T, uint8_t>::value) {
+            const int32_t local_cur_start_pos = origin.cur_start_pos - cur_pos_;
+            const int64_t src_abs_pos = source_ori_pos + origin.ori_start_pos;
+            const int64_t dst_abs_pos = origin.cur_start_pos;
+            if (src_abs_pos == dst_abs_pos || origin.matched_len <= 0) {
+              return;
+            }
+            std::vector<float> rerotation_cos(
+                origin.matched_len * head_dim / 2);
+            std::vector<float> rerotation_sin(
+                origin.matched_len * head_dim / 2);
+            LMStore::compute_rerotation_cos_sin(
+                rope_freqs_cos_.data(),
+                rope_freqs_sin_.data(),
+                rerotation_cos.data(),
+                rerotation_sin.data(),
+                seq_len,
+                head_dim / 2,
+                src_abs_pos,
+                dst_abs_pos,
+                origin.matched_len);
+            for (int layer = 0; layer < num_layers; ++layer) {
+              ET_CHECK_MSG(
+                  kv_output_quant_attrs_.size() > static_cast<size_t>(layer * 2),
+                  "Missing KV quant attrs for layer %d",
+                  layer);
+              std::vector<uint8_t> k_compact(
+                  num_heads * head_dim * origin.matched_len);
+              for (int idx = 0; idx < num_heads * head_dim; ++idx) {
+                const uint8_t* src_ptr =
+                    reinterpret_cast<uint8_t*>(k_store[layer]) +
+                    idx * prompt_tokens.size() + local_cur_start_pos;
+                uint8_t* dst_ptr =
+                    k_compact.data() + idx * origin.matched_len;
+                std::memcpy(
+                    dst_ptr,
+                    src_ptr,
+                    origin.matched_len * sizeof(uint8_t));
+              }
+              LMStore::sq_per_tensor_params q_params{
+                  kv_output_quant_attrs_[layer * 2].scale,
+                  kv_output_quant_attrs_[layer * 2].zero_point};
+              LMStore::rerotate_k_u8(
+                  k_compact.data(),
+                  k_compact.data(),
+                  rerotation_cos.data(),
+                  rerotation_sin.data(),
+                  num_heads,
+                  origin.matched_len,
+                  head_dim,
+                  q_params,
+                  true);
+              for (int idx = 0; idx < num_heads * head_dim; ++idx) {
+                uint8_t* dst_ptr =
+                    reinterpret_cast<uint8_t*>(k_store[layer]) +
+                    idx * prompt_tokens.size() + local_cur_start_pos;
+                const uint8_t* src_ptr =
+                    k_compact.data() + idx * origin.matched_len;
+                std::memcpy(
+                    dst_ptr,
+                    src_ptr,
+                    origin.matched_len * sizeof(uint8_t));
+              }
+            }
+          }
+        };
+
+    auto load_origin_into_kv_cache = [&](const LMStore::RecipeOrigin& origin, bool is_blend=false, int64_t recipe_start_pos=0) {
+      if (origin.type == LMStore::ChunkPromptType::kNew) {
+        return;
+      }
+      const int32_t local_cur_start_pos = origin.cur_start_pos - cur_pos_;
+      ET_LOG(Info, "Executing origin: row_id=%d cur_start=%d ori_start=%d len=%d type=%d",
+        origin.row_id, origin.cur_start_pos, origin.ori_start_pos, 
+        origin.matched_len, static_cast<int>(origin.type));
+      int64_t source_ori_pos = 0;
+      kv_store_->read_ori_pos(origin.row_id, &source_ori_pos);
+      kv_store_->transfer_cache(
+          k_store,
+          v_store,
+          origin.row_id,
+          origin.ori_start_pos,
+          local_cur_start_pos,
+          origin.matched_len,
+          prompt_tokens.size());
+      if (origin.type == LMStore::ChunkPromptType::kNonPrefix) {
+        rerotate_origin_slice(origin, source_ori_pos);
+      }
+      if (!is_blend) {
+        kv_manager_->transfer_cache(
+            k_store,
+            v_store,
+            prompt_tokens.size(),
+            origin.matched_len,
+            origin.matched_len,
+            false,
+            local_cur_start_pos,
+            origin.cur_start_pos);
+      } else {
+        kv_manager_->transfer_cache_blend(
+            k_store,
+            v_store,
+            prompt_tokens.size(),
+            origin.matched_len,
+            origin.matched_len,
+            blender_prompt_processor_ar_len_,
+            local_cur_start_pos,
+            origin.cur_start_pos - recipe_start_pos);
+      }
+    };
+
+    if (!build_input_result.recipes.empty()) {
+      const auto& first_recipe = build_input_result.recipes.front();
+      const bool full_prefix_match =
+          build_input_result.recipes.size() == 1 &&
+          first_recipe.start == cur_pos_ &&
+          first_recipe.end + 1 == cur_pos_ + num_prompt_tokens &&
+          first_recipe.origins.size() == 1 &&
+          first_recipe.origins[0].type == LMStore::ChunkPromptType::kPrefix;
+      ET_LOG(
+          Info,
+          "build_input full_prefix_match=%d first_recipe_start=%d first_recipe_end=%d first_recipe_origins=%zu",
+          static_cast<int>(full_prefix_match),
+          first_recipe.start,
+          first_recipe.end,
+          first_recipe.origins.size());
+
+      if (full_prefix_match) {
+        load_origin_into_kv_cache(first_recipe.origins[0]);
+        ET_CHECK_MSG(
+            kv_store_->read_next_token(first_recipe.origins[0].row_id, &cur_token),
+            "Failed to read next token for full-prefix hit.");
+        matched = true;
+      } else {
+        for (const auto& recipe : build_input_result.recipes) {
+          ET_LOG(
+              Info,
+              "Executing recipe: start=%d end=%d graph_type=%d origins=%zu",
+              recipe.start,
+              recipe.end,
+              static_cast<int>(recipe.group),
+              recipe.origins.size());
+          if (recipe.group == LMStore::ChunkGraphType::kPrefixReuse) {
+            // no computation
+            auto prefix_start_time = time_in_ms();
+            for (const auto& origin : recipe.origins) {
+              load_origin_into_kv_cache(origin);
+            }
+            auto prefix_end_time = time_in_ms();
+            ET_LOG(Info, "Prefix reuse took %ld ms", prefix_end_time - prefix_start_time);
+            continue;
+          }
+
+          std::vector<uint64_t> chunk_tokens(
+              prompt_tokens.begin() + (recipe.start - cur_pos_),
+              prompt_tokens.begin() + (recipe.end - cur_pos_) + 1);
+          const int64_t chunk_start_pos = recipe.start;
+          if (recipe.group == LMStore::ChunkGraphType::kSelectiveRecompute) {
+            for (const auto& origin : recipe.origins) {
+              load_origin_into_kv_cache(origin, true, recipe.start);
+            }
+            std::vector<int32_t> valid_mask(blender_prompt_processor_ar_len_, 0);
+            for (int i = 0;
+                i < static_cast<int>(chunk_tokens.size()) &&
+                i < static_cast<int>(valid_mask.size()); ++i) {
+              valid_mask[i] = 1;
+            }
+            auto prefill_res = blender_prompt_processor_->prefill(
+                chunk_tokens,
+                chunk_start_pos,
+                dump_logits,
+                valid_mask.data(),
+                attention_sink_rope_runner_.get());
+            ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+            cur_token = prefill_res.get();
+          } else {
+            auto prefill_res = prompt_processor_->prefill(
+                chunk_tokens,
+                chunk_start_pos,
+                dump_logits,
+                attention_sink_rope_runner_.get());
+            ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+            cur_token = prefill_res.get();
+          }
+        }
+      }
+    }
   } else {
-    if (eval_mode_ == EvalMode::kBlend) {
-      auto prefill_res = blender_prompt_processor_->prefill(
-          prompt_tokens, cur_pos_, dump_logits, nullptr, attention_sink_rope_runner_.get());
-      ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
-      cur_token = prefill_res.get();
-    } else {
-      auto prefill_res = prompt_processor_->prefill(
+    // prefill inference
+    auto prefill_res = prompt_processor_->prefill(
           prompt_tokens, cur_pos_, dump_logits, attention_sink_rope_runner_.get());
-      ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
-      cur_token = prefill_res.get();
-    }
+    ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+    cur_token = prefill_res.get();
   }
-  cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
   // store kv
@@ -829,16 +1249,18 @@ Error Runner<T>::generate_from_prompt_or_file(
     ET_LOG(
       Info,
       "Storing KV caches to disk...\n");
-    kv_store_->write_prompt_tokens(prompt_tokens);
-    kv_store_->write_next_token(cur_token);
     kv_manager_->transfer_cache(k_store, v_store, prompt_tokens.size(),
         prompt_tokens.size(), prompt_tokens.size(), true);
-    kv_store_->transfer_cache(k_store, v_store, true);
+    ET_CHECK_MSG(
+        kv_store_->store_prompt_cache(
+            prompt_tokens, cur_token, cur_pos_, k_store, v_store),
+        "Failed to store KV cache into SQLiteKVStore.");
   }
   for (int j = 0; j < num_layers; ++j) {
     free(k_store[j]);
     free(v_store[j]);
   }
+  cur_pos_ += num_prompt_tokens;
 
   if (is_embedding_model) {
     const std::vector<uint16_t>& embedding_vec =
@@ -923,6 +1345,127 @@ Result<DecoderModelVersion> Runner<T>::get_decoder_model_version() {
     stats_.model_load_end_ms = time_in_ms();
   }
   return decoder_model_version_;
+}
+
+template <typename T>
+void Runner<T>::reset() {
+  cur_pos_ = 0;
+  if (kv_manager_ != nullptr) {
+    kv_manager_->rearrange_cache(0);
+  }
+  stats_.reset(true);
+}
+
+template <typename T>
+Error Runner<T>::export_kv_snapshot(KVSnapshot* snapshot) {
+  ET_CHECK_MSG(snapshot != nullptr, "snapshot must not be null");
+  if (!is_loaded()) {
+    stats_.model_load_start_ms = time_in_ms();
+    ET_CHECK_OK_OR_RETURN_ERROR(load());
+    stats_.model_load_end_ms = time_in_ms();
+  }
+
+  snapshot->cur_pos = cur_pos_;
+  snapshot->context_len = context_len_;
+  snapshot->num_layers = kv_manager_->get_num_layers();
+  snapshot->num_heads = kv_manager_->get_num_heads();
+  snapshot->head_dim = kv_manager_->get_head_dim();
+  snapshot->k_layers.clear();
+  snapshot->v_layers.clear();
+
+  if (cur_pos_ <= 0) {
+    return Error::Ok;
+  }
+
+  kv_manager_->rearrange_cache(0);
+
+  const size_t layer_elems = static_cast<size_t>(snapshot->num_heads) *
+      static_cast<size_t>(snapshot->head_dim) *
+      static_cast<size_t>(snapshot->cur_pos);
+  snapshot->k_layers.resize(snapshot->num_layers);
+  snapshot->v_layers.resize(snapshot->num_layers);
+  std::vector<T*> k_ptrs(snapshot->num_layers, nullptr);
+  std::vector<T*> v_ptrs(snapshot->num_layers, nullptr);
+  for (int64_t layer = 0; layer < snapshot->num_layers; ++layer) {
+    snapshot->k_layers[layer].resize(layer_elems);
+    snapshot->v_layers[layer].resize(layer_elems);
+    k_ptrs[layer] = snapshot->k_layers[layer].data();
+    v_ptrs[layer] = snapshot->v_layers[layer].data();
+  }
+  kv_manager_->transfer_cache(
+      k_ptrs,
+      v_ptrs,
+      static_cast<int>(snapshot->cur_pos),
+      static_cast<int>(snapshot->cur_pos),
+      static_cast<int32_t>(snapshot->cur_pos),
+      true);
+  return Error::Ok;
+}
+
+template <typename T>
+Error Runner<T>::import_kv_snapshot(const KVSnapshot& snapshot) {
+  if (!is_loaded()) {
+    stats_.model_load_start_ms = time_in_ms();
+    ET_CHECK_OK_OR_RETURN_ERROR(load());
+    stats_.model_load_end_ms = time_in_ms();
+  }
+
+  ET_CHECK_MSG(
+      snapshot.context_len == context_len_,
+      "Snapshot context_len (%d) mismatches runner context_len (%d)",
+      snapshot.context_len,
+      context_len_);
+  ET_CHECK_MSG(
+      snapshot.num_layers == kv_manager_->get_num_layers(),
+      "Snapshot num_layers (%lld) mismatches runner num_layers (%lld)",
+      static_cast<long long>(snapshot.num_layers),
+      static_cast<long long>(kv_manager_->get_num_layers()));
+  ET_CHECK_MSG(
+      snapshot.num_heads == kv_manager_->get_num_heads(),
+      "Snapshot num_heads (%lld) mismatches runner num_heads (%lld)",
+      static_cast<long long>(snapshot.num_heads),
+      static_cast<long long>(kv_manager_->get_num_heads()));
+  ET_CHECK_MSG(
+      snapshot.head_dim == kv_manager_->get_head_dim(),
+      "Snapshot head_dim (%lld) mismatches runner head_dim (%lld)",
+      static_cast<long long>(snapshot.head_dim),
+      static_cast<long long>(kv_manager_->get_head_dim()));
+
+  reset();
+  if (snapshot.cur_pos <= 0) {
+    return Error::Ok;
+  }
+
+  ET_CHECK_MSG(
+      snapshot.k_layers.size() == static_cast<size_t>(snapshot.num_layers) &&
+          snapshot.v_layers.size() == static_cast<size_t>(snapshot.num_layers),
+      "Snapshot layer count is inconsistent");
+
+  std::vector<T*> k_ptrs(snapshot.num_layers, nullptr);
+  std::vector<T*> v_ptrs(snapshot.num_layers, nullptr);
+  const size_t expected_layer_elems = static_cast<size_t>(snapshot.num_heads) *
+      static_cast<size_t>(snapshot.head_dim) *
+      static_cast<size_t>(snapshot.cur_pos);
+  for (int64_t layer = 0; layer < snapshot.num_layers; ++layer) {
+    ET_CHECK_MSG(
+        snapshot.k_layers[layer].size() == expected_layer_elems &&
+            snapshot.v_layers[layer].size() == expected_layer_elems,
+        "Snapshot layer %lld has invalid element count",
+        static_cast<long long>(layer));
+    k_ptrs[layer] = const_cast<T*>(snapshot.k_layers[layer].data());
+    v_ptrs[layer] = const_cast<T*>(snapshot.v_layers[layer].data());
+  }
+
+  kv_manager_->rearrange_cache(0);
+  kv_manager_->transfer_cache(
+      k_ptrs,
+      v_ptrs,
+      static_cast<int>(snapshot.cur_pos),
+      static_cast<int>(snapshot.cur_pos),
+      static_cast<int32_t>(snapshot.cur_pos),
+      false);
+  cur_pos_ = snapshot.cur_pos;
+  return Error::Ok;
 }
 
 // Explicit instantiations

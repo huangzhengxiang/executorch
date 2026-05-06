@@ -124,6 +124,8 @@ def process_model_args(
             if control_args.model_mode == "lookahead"
             else 1
         )
+    elif mode == Mode.BLENDER:
+        ar_len = control_args.blender_ar_len
     else:
         ar_len = control_args.prefill_ar_len
 

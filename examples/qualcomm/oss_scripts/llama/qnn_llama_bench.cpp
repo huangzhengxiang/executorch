@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -40,6 +41,10 @@ DEFINE_string(
     attention_sink_rope_path,
     "",
     "[Attention Sink] The Attention Sink Rope Model serialized in flatbuffer format.");
+DEFINE_string(
+    rope_config_path,
+    "",
+    "Path to the RoPE config json used to precompute freqs_cos/freqs_sin.");
 DEFINE_string(
     tokenizer_path,
     "tokenizer.bin",
@@ -84,6 +89,14 @@ DEFINE_int32(
     blend_len,
     32,
     "Blend length for BlenderMode.");
+DEFINE_double(
+    latency_ratio,
+    0.2,
+    "Latency ratio hyper-parameter passed to KVStore build_input().");
+DEFINE_double(
+    recompute_ratio,
+    0.25,
+    "Selective recompute reuse ratio passed to KVStore build_input().");
 DEFINE_bool(
     separate_embed,
     false,
@@ -105,7 +118,11 @@ DEFINE_int32(warmup_iters, 0, "Warmup iterations per (prefill, generation) pair.
 DEFINE_uint64(
     dummy_token_id,
     1,
-    "Token id used to build dummy prompt tokens for prefill.");
+    "Fallback token id used only when --prompt_token_seed is set and a deterministic sequence is desired.");
+DEFINE_uint64(
+    prompt_token_seed,
+    0,
+    "Seed for benchmark prompt token generation. 0 uses nondeterministic seeding; non-zero makes prompt tokens reproducible.");
 DEFINE_string(
     output_path,
     "qnn_llama_bench.csv",
@@ -182,18 +199,53 @@ std::vector<int32_t> parse_int_list(
   return values;
 }
 
+int32_t infer_vocab_size(executorch::extension::Module* module) {
+  auto method_meta = module->method_meta("kv_forward");
+  ET_CHECK_MSG(
+      method_meta.ok(),
+      "Failed to get method_meta for kv_forward: 0x%x",
+      static_cast<unsigned int>(method_meta.error()));
+  auto logits_meta = method_meta->output_tensor_meta(0);
+  ET_CHECK_MSG(
+      logits_meta.ok(),
+      "Failed to get kv_forward output tensor meta: 0x%x",
+      static_cast<unsigned int>(logits_meta.error()));
+  const auto sizes = logits_meta->sizes();
+  ET_CHECK_MSG(
+      sizes.size() >= 3 && sizes[2] > 0 &&
+          sizes[2] <= std::numeric_limits<int32_t>::max(),
+      "Invalid vocab size inferred from kv_forward output tensor");
+  return static_cast<int32_t>(sizes[2]);
+}
+
 class BenchTokenizer final : public tokenizers::Tokenizer {
  public:
   static constexpr const char* kBenchPromptMagic = "__qnn_llama_bench_prompt__";
   static constexpr uint64_t kEosSentinel =
       std::numeric_limits<uint64_t>::max() - 1;
 
-  BenchTokenizer(int32_t prefill_len, uint64_t dummy_token_id)
-      : prefill_len_(prefill_len), dummy_token_id_(dummy_token_id) {
+  BenchTokenizer(
+      int32_t prefill_len,
+      uint64_t dummy_token_id,
+      uint64_t prompt_token_seed,
+      int32_t vocab_size)
+      : prefill_len_(prefill_len),
+        dummy_token_id_(dummy_token_id),
+        vocab_size_limit_(vocab_size) {
     initialized_ = true;
-    vocab_size_ = std::numeric_limits<int32_t>::max();
+    vocab_size_ = vocab_size_limit_;
     bos_tok_ = dummy_token_id_;
     eos_tok_ = kEosSentinel;
+
+    ET_CHECK_MSG(vocab_size_limit_ > 1, "Invalid vocab size %d", vocab_size_limit_);
+    std::mt19937_64 rng(
+        prompt_token_seed == 0 ? std::random_device{}() : prompt_token_seed);
+    std::uniform_int_distribution<uint64_t> dist(
+        0, static_cast<uint64_t>(vocab_size_limit_ - 1));
+    prompt_tokens_.reserve(static_cast<size_t>(prefill_len_));
+    for (int32_t i = 0; i < prefill_len_; ++i) {
+      prompt_tokens_.push_back(dist(rng));
+    }
   }
 
   tokenizers::Error load(const std::string&) override {
@@ -214,8 +266,7 @@ class BenchTokenizer final : public tokenizers::Tokenizer {
     if (input != kBenchPromptMagic) {
       return std::vector<uint64_t>{kEosSentinel};
     }
-    return std::vector<uint64_t>(
-        static_cast<size_t>(prefill_len_), dummy_token_id_);
+    return prompt_tokens_;
   }
 
   tokenizers::Result<std::string> decode(uint64_t, uint64_t) const override {
@@ -226,6 +277,8 @@ class BenchTokenizer final : public tokenizers::Tokenizer {
  private:
   int32_t prefill_len_;
   uint64_t dummy_token_id_;
+  int32_t vocab_size_limit_;
+  std::vector<uint64_t> prompt_tokens_;
 };
 
 struct Sample {
@@ -286,8 +339,13 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
                 MmapUseMlockIgnoreErrors);
   }
 
+  const int32_t vocab_size = infer_vocab_size(module.get());
   auto tokenizer =
-      std::make_unique<BenchTokenizer>(prefill_len, FLAGS_dummy_token_id);
+      std::make_unique<BenchTokenizer>(
+          prefill_len,
+          FLAGS_dummy_token_id,
+          FLAGS_prompt_token_seed,
+          vocab_size);
   // Keep the parameter ordering aligned with qnn_llama_runner.cpp.
   example::Runner<T> runner(
       std::move(module),
@@ -305,8 +363,11 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
       FLAGS_kv_store,
       FLAGS_test_level,
       FLAGS_blend_len,
+      static_cast<float>(FLAGS_latency_ratio),
+      static_cast<float>(FLAGS_recompute_ratio),
       FLAGS_separate_embed,
       FLAGS_embedding_matrix_path.c_str(),
+      FLAGS_rope_config_path.c_str(),
       nullptr,
       std::move(tokenizer),
       std::move(attention_sink_rope_module));
@@ -470,8 +531,11 @@ void run_embed_feature() {
       FLAGS_kv_store,
       FLAGS_test_level,
       FLAGS_blend_len,
+      static_cast<float>(FLAGS_latency_ratio),
+      static_cast<float>(FLAGS_recompute_ratio),
       FLAGS_separate_embed,
       FLAGS_embedding_matrix_path.c_str(),
+      FLAGS_rope_config_path.c_str(),
       nullptr,
       nullptr,
       std::move(attention_sink_rope_module));

@@ -367,12 +367,12 @@ void SeparateEmbedding::dequantize_row_to_float(
       std::chrono::duration_cast<std::chrono::microseconds>(
           dequant_end - dequant_start)
           .count());
-  ET_LOG(
-      Info,
-      "separate_embed dequant: token=%llu elems=%llu cost=%lluus",
-      static_cast<unsigned long long>(token_id),
-      static_cast<unsigned long long>(elems),
-      static_cast<unsigned long long>(dequant_us));
+  // ET_LOG(
+  //     Info,
+  //     "separate_embed dequant: token=%llu elems=%llu cost=%lluus",
+  //     static_cast<unsigned long long>(token_id),
+  //     static_cast<unsigned long long>(elems),
+  //     static_cast<unsigned long long>(dequant_us));
 }
 
 bool SeparateEmbedding::read_from_file(
@@ -399,12 +399,12 @@ bool SeparateEmbedding::read_from_file(
       std::chrono::duration_cast<std::chrono::microseconds>(
           read_end - read_start)
           .count());
-  ET_LOG(
-      Info,
-      "separate_embed read: offset=%llu bytes=%llu cost=%lluus",
-      static_cast<unsigned long long>(offset),
-      static_cast<unsigned long long>(bytes),
-      static_cast<unsigned long long>(read_us));
+  // ET_LOG(
+  //     Info,
+  //     "separate_embed read: offset=%llu bytes=%llu cost=%lluus",
+  //     static_cast<unsigned long long>(offset),
+  //     static_cast<unsigned long long>(bytes),
+  //     static_cast<unsigned long long>(read_us));
   return true;
 }
 

@@ -487,6 +487,10 @@ Result<uint64_t> BlenderPromptProcessor<T>::prefill(
     // Update KV Cache with the output results
     // kv_manager_->update_cache(metadata_.ar_len, shifted_pos, n_update, {});
     auto kv_start_time = time_in_ms();
+    // int32_t* imp_indices_ptr = output_tensors_[output_tensors_.size()-1].mutable_data_ptr<int32_t>();
+    // for (int i=0; i< metadata_.blend_len; i++) {
+    //   ET_LOG(Info, "imp_indices[%d]: %d", i, imp_indices_ptr[i]);
+    // }
     kv_manager_->blender_update_cache(metadata_.ar_len, 
                                       shifted_pos, 
                                       metadata_.blend_len, 

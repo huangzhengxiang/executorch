@@ -434,6 +434,12 @@ def _build_parser():
         default=32,
         type=int,
     )
+    parser.add_argument(
+        "--blender_ar_len",
+        help="AR length for blender_forward in blender mode. Defaults to --prefill_ar_len when omitted.",
+        default=None,
+        type=int,
+    )
 
     parser.add_argument(
         "--num_layers",
@@ -569,6 +575,8 @@ def export_llama(args) -> None:
 
     if args.max_context_len is None:
         args.max_context_len = args.max_seq_len
+    if args.blender_ar_len is None:
+        args.blender_ar_len = args.prefill_ar_len
     if args.use_attention_sink is None:
         assert (
             args.max_context_len >= args.max_seq_len
@@ -587,8 +595,11 @@ def export_llama(args) -> None:
             args.max_context_len >= args.prefill_ar_len
         ), "Please ensure max_context_len is >= prefill_ar_len"
         assert (
-            args.blend_len <= args.prefill_ar_len
-        ), "Please ensure blend_len is <= prefill_ar_len"
+            args.max_context_len >= args.blender_ar_len
+        ), "Please ensure max_context_len is >= blender_ar_len"
+        assert (
+            args.blend_len <= args.blender_ar_len
+        ), "Please ensure blend_len is <= blender_ar_len"
         pte_filename = "blender_llama_qnn"
     elif args.model_mode == "lookahead":
         assert (

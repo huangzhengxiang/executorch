@@ -174,6 +174,16 @@ class KVManager {
       bool directionM2D, // true: M2D, false: D2M
       int disk_start_id=0,
       int mem_start_id=0);
+  
+  void transfer_cache_blend(
+      std::vector<T*>& k_buffer,
+      std::vector<T*>& v_buffer,
+      int buffer_seq_dim,
+      int copy_len,
+      int32_t n_past,
+      int blend_ar_len,
+      int disk_start_id=0,
+      int mem_start_id=0);
 
   const std::vector<KVCache<T>>& get_k_cache_() const {
     return k_cache_;

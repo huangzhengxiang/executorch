@@ -34,6 +34,10 @@ DEFINE_string(
     "",
     "[Attention Sink] The Attention Sink Rope Model is serialized using the flatbuffer format. If specified, seq_len can exceed the context length defined in the model.");
 DEFINE_string(
+    rope_config_path,
+    "",
+    "Path to the RoPE config json used to precompute freqs_cos/freqs_sin.");
+DEFINE_string(
     output_path,
     "outputs.txt",
     "Executorch inference data output path.");
@@ -74,6 +78,10 @@ DEFINE_string(
     system_prompt,
     "",
     "Tells the model what kind of assistant it should be. For example, You are a helpful AI assistant for travel tips and recommendations. Default is None");
+DEFINE_bool(
+    no_think,
+    false,
+    "For Qwen3, append <think></think> to the end of the formatted prompt.");
 DEFINE_double(
     temperature,
     0.0f,
@@ -115,6 +123,14 @@ DEFINE_int32(
     blend_len,
     32,
     "Blend Length for BlenderMode");
+DEFINE_double(
+    latency_ratio,
+    0.2,
+    "Latency ratio hyper-parameter passed to KVStore build_input().");
+DEFINE_double(
+    recompute_ratio,
+    0.25,
+    "Selective recompute reuse ratio passed to KVStore build_input().");
 DEFINE_bool(
     separate_embed,
     false,
@@ -208,6 +224,9 @@ std::string get_formatted_prompt(
         formatted_prompt.append("<|im_end|>\n");
       }
       formatted_prompt.append("<|im_start|>assistant");
+      if (FLAGS_no_think) {
+        formatted_prompt.append("<think></think>");
+      }
       break;
     case example::DecoderModelVersion::kQwen3Embed:
       formatted_prompt.append(prompt);
@@ -286,8 +305,11 @@ void start_runner(
       FLAGS_kv_store,
       FLAGS_test_level,
       FLAGS_blend_len,
+      static_cast<float>(FLAGS_latency_ratio),
+      static_cast<float>(FLAGS_recompute_ratio),
       FLAGS_separate_embed,
       FLAGS_embedding_matrix_path.c_str(),
+      FLAGS_rope_config_path.c_str(),
       FLAGS_dump_intermediate_outputs ? &etdump_gen : nullptr,
       nullptr,
       std::move(attention_sink_rope_module));

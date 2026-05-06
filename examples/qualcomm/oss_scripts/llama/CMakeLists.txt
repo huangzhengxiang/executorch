@@ -61,6 +61,7 @@ target_include_directories(
   qnn_llama_runner PUBLIC ${_common_include_directories}
                           ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/include/
                           ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/
+                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/rapidjson/include/
 )
 
 executorch_target_link_options_shared_lib(quantized_ops_lib)
@@ -93,6 +94,50 @@ set_target_properties(
   qnn_llama_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
 )
 
+# build qnn llama server
+set(_llama_server__srcs ${_llama_runner__srcs})
+list(FILTER _llama_server__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")
+list(
+  PREPEND
+  _llama_server__srcs
+  ${CMAKE_CURRENT_LIST_DIR}/qnn_llama_server.cpp
+)
+
+list(APPEND _llama_server__srcs)
+
+add_executable(qnn_llama_server ${_llama_server__srcs})
+target_include_directories(
+  qnn_llama_server PUBLIC ${_common_include_directories}
+                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/include/
+                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/
+                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/rapidjson/include/
+)
+target_link_libraries(
+  qnn_llama_server
+  LMStore
+  qnn_executorch_backend
+  executorch_core
+  extension_data_loader
+  extension_flat_tensor
+  extension_llm_runner
+  extension_module
+  extension_tensor
+  etdump
+  flatccrt
+  gflags
+  custom_ops
+  quantized_ops_lib
+  quantized_kernels
+  tokenizers::tokenizers
+)
+target_include_directories(
+  qnn_llama_server PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
+)
+target_compile_options(qnn_llama_server PUBLIC ${_common_compile_options})
+set_target_properties(
+  qnn_llama_server PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+)
+
 # build qnn llama bench
 set(_llama_bench__srcs ${_llama_runner__srcs})
 list(FILTER _llama_bench__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")
@@ -109,6 +154,7 @@ target_include_directories(
   qnn_llama_bench PUBLIC ${_common_include_directories}
                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/include/
                          ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/
+                         ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/rapidjson/include/
 )
 target_link_libraries(
   qnn_llama_bench
@@ -167,7 +213,8 @@ add_executable(qnn_multimodal_runner ${_multimodal_runner__srcs})
 target_include_directories(
   qnn_multimodal_runner PUBLIC ${_common_include_directories}
                                ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/include/
-                               ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/  
+                               ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/
+                               ${EXECUTORCH_SOURCE_DIR}/examples/qualcomm/third_party/MobileLMStore/vendor/rapidjson/include/
 )
 target_include_directories(
   qnn_multimodal_runner

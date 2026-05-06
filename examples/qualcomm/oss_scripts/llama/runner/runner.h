@@ -61,6 +61,16 @@ enum KvBitWidth {
 template <typename T>
 class Runner : public executorch::extension::llm::IRunner {
  public:
+  struct KVSnapshot {
+    int64_t cur_pos{0};
+    int32_t context_len{0};
+    int64_t num_layers{0};
+    int64_t num_heads{0};
+    int64_t head_dim{0};
+    std::vector<std::vector<T>> k_layers;
+    std::vector<std::vector<T>> v_layers;
+  };
+
   explicit Runner(
       std::unique_ptr<executorch::extension::Module> module,
       const std::string& decoder_model,
@@ -77,8 +87,11 @@ class Runner : public executorch::extension::llm::IRunner {
       const bool use_kv_store = false,
       const int test_level = 0,
       const int blend_len = 0,
+      const float latency_ratio = 0.2f,
+      const float recompute_ratio = 0.25f,
       const bool separate_embed = false,
       const std::string& embedding_matrix_path = "",
+      const std::string& rope_config_path = "",
       torch::executor::EventTracer* event_tracer = nullptr,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
@@ -101,8 +114,10 @@ class Runner : public executorch::extension::llm::IRunner {
       std::function<void(const std::string&)> token_callback = {},
       std::function<void(const executorch::llm::Stats&)> stats_callback = {});
   void stop() override {};
-  void reset() override {};
+  void reset() override;
   executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version();
+  executorch::runtime::Error export_kv_snapshot(KVSnapshot* snapshot);
+  executorch::runtime::Error import_kv_snapshot(const KVSnapshot& snapshot);
 
  private:
   struct KvQuantAttr {
@@ -131,15 +146,23 @@ class Runner : public executorch::extension::llm::IRunner {
   int use_kv_store_{false};
   int test_level_{0};
   int blend_len_{0};
+  float latency_ratio_{0.2f};
+  float recompute_ratio_{0.25f};
   bool separate_embed_{false};
   std::string embedding_matrix_path_;
+  std::string rope_config_path_;
 
   // Defaults to StaticCahce, indicating that the model does not use a
   // global/local architecture.
   CacheMode cache_mode_{CacheMode::StaticCahce};
   int64_t cur_pos_{0};
+  int32_t rope_head_dim_{0};
+  int32_t rope_freqs_seq_len_{0};
+  int32_t prompt_processor_ar_len_{0};
+  int32_t blender_prompt_processor_ar_len_{0};
 
   std::string tokenizer_path_;
+  std::string model_path_;
   std::string performance_output_path_;
   std::string dump_logits_path_;
   float temperature_;
@@ -158,9 +181,12 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<BlenderPromptProcessor<T>> blender_prompt_processor_;
   std::unique_ptr<PromptProcessor<T>> prompt_processor_;
   std::unique_ptr<TokenGenerator<T>> token_generator_;
+  std::vector<float> rope_freqs_cos_;
+  std::vector<float> rope_freqs_sin_;
   std::vector<KvQuantAttr> kv_output_quant_attrs_;
   SeparateEmbedding separate_embedding_;
   void load_kv_quant_attrs();
+  executorch::runtime::Error maybe_initialize_rope_freqs(int32_t seq_len);
 
   // stats
   executorch::llm::Stats stats_;
