@@ -172,6 +172,7 @@ def annotate_blend(  # noqa: C901
                 torch.ops.aten.pow.Tensor_Tensor,
                 torch.ops.aten.sum.dim_IntList,
                 torch.ops.aten.sum.default,
+                torch.ops.aten.div.Tensor,
                 torch.ops.aten.copy_.default,
                 torch.ops.aten.fill_.Tensor
             ]:

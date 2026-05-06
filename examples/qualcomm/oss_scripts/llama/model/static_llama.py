@@ -582,7 +582,7 @@ class LlamaAttention(nn.Module):
             # atten_mask: [B, 1, S, CL]
             # valid_mask: [B, S]
             diff_k = torch.sum(
-                (k.transpose(2, 3) - k_caches[:, :, :, -self.ar_len:]) ** 2, dim=[1, 2],
+                ((k.transpose(2, 3) - k_caches[:, :, :, -self.ar_len:]) ** 2)/self.head_dim, dim=[1, 2],
                 keepdim=False
             )
             diff_k = torch.where(valid_mask == 1, 
