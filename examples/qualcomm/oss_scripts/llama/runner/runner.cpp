@@ -204,11 +204,15 @@ Runner<T>::Runner(
     const int blend_len,
     const float latency_ratio,
     const float recompute_ratio,
+    const bool enable_nonprefix_lcs,
+    const bool use_fp16_rerotation,
+    const uint64_t cpu_kv_pool_size_mb,
     const bool separate_embed,
     const std::string& embedding_matrix_path,
     const std::string& rope_config_path,
     torch::executor::EventTracer* event_tracer,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
+    std::shared_ptr<LMStore::CPUKVPool<T>> kv_pool,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
     : module_(std::move(module)),
       ngram_(ngram),
@@ -219,6 +223,9 @@ Runner<T>::Runner(
       blend_len_(blend_len),
       latency_ratio_(latency_ratio),
       recompute_ratio_(recompute_ratio),
+      enable_nonprefix_lcs_(enable_nonprefix_lcs),
+      use_fp16_rerotation_(use_fp16_rerotation),
+      cpu_kv_pool_size_mb_(cpu_kv_pool_size_mb),
       separate_embed_(separate_embed),
       embedding_matrix_path_(embedding_matrix_path),
       rope_config_path_(rope_config_path),
@@ -231,6 +238,7 @@ Runner<T>::Runner(
       shared_buffer_(shared_buffer),
       event_tracer_(event_tracer),
       tokenizer_(std::move(tokenizer)),
+      kv_pool_(std::move(kv_pool)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)) {
   stats_.reset();
 
@@ -321,7 +329,13 @@ bool Runner<T>::is_loaded() const {
 
 template <typename T>
 Error Runner<T>::maybe_initialize_rope_freqs(int32_t seq_len) {
-  if (rope_config_path_.empty() || seq_len <= 0) {
+  if (rope_config_path_.empty()) {
+    return Error::Ok;
+  }
+
+  const int32_t target_seq_len =
+      context_len_ > 0 ? context_len_ : seq_len;
+  if (target_seq_len <= 0) {
     return Error::Ok;
   }
 
@@ -339,9 +353,9 @@ Error Runner<T>::maybe_initialize_rope_freqs(int32_t seq_len) {
       half_dim > 0, "Invalid RoPE half_dim computed from %d", rope_head_dim_);
 
   const size_t expected_size =
-      static_cast<size_t>(seq_len) * static_cast<size_t>(half_dim);
+      static_cast<size_t>(target_seq_len) * static_cast<size_t>(half_dim);
   if (
-      rope_freqs_seq_len_ == seq_len &&
+      rope_freqs_seq_len_ == target_seq_len &&
       rope_freqs_cos_.size() == expected_size &&
       rope_freqs_sin_.size() == expected_size)
   {
@@ -370,13 +384,23 @@ Error Runner<T>::maybe_initialize_rope_freqs(int32_t seq_len) {
   rope_freqs_cos_.resize(expected_size);
   rope_freqs_sin_.resize(expected_size);
   LMStore::precompute_rope_freqs_cis(
-      rope_freqs_cos_.data(), rope_freqs_sin_.data(), seq_len, cfg);
-  rope_freqs_seq_len_ = seq_len;
+      rope_freqs_cos_.data(), rope_freqs_sin_.data(), target_seq_len, cfg);
+#if defined(LMSTORE_HAS_FP16)
+  rope_freqs_cos_fp16_.resize(expected_size);
+  rope_freqs_sin_fp16_.resize(expected_size);
+  for (size_t i = 0; i < expected_size; ++i) {
+    rope_freqs_cos_fp16_[i] =
+        static_cast<LMStore::fp16_t>(rope_freqs_cos_[i]);
+    rope_freqs_sin_fp16_[i] =
+        static_cast<LMStore::fp16_t>(rope_freqs_sin_[i]);
+  }
+#endif
+  rope_freqs_seq_len_ = target_seq_len;
 
   ET_LOG(
       Info,
       "Initialized RoPE freqs_cos/freqs_sin with seq_len=%d head_dim=%d from %s",
-      seq_len,
+      target_seq_len,
       cfg.head_dim,
       rope_config_path_.c_str());
   return Error::Ok;
@@ -953,10 +977,12 @@ Error Runner<T>::generate_from_prompt_or_file(
                 << "-" << std::hex << model_path_hash << ".bin";
   kv_store_ = std::make_unique<LMStore::SQLiteKVStore<T>>(
       kv_store_name.str(), num_layers, num_heads, head_dim, prompt_tokens.size());
-  std::vector<T*> k_store(num_layers, nullptr), v_store(num_layers, nullptr);
-  for (int j = 0; j < num_layers; ++j) {
-    k_store[j] = (T*)malloc(num_heads * head_dim * prompt_tokens.size() * sizeof(T));
-    v_store[j] = (T*)malloc(num_heads * prompt_tokens.size() * head_dim  * sizeof(T));
+  if (!kv_pool_) {
+    kv_pool_ = std::make_shared<LMStore::CPUKVPool<T>>(
+        num_layers,
+        num_heads,
+        head_dim,
+        static_cast<size_t>(cpu_kv_pool_size_mb_) * 1024ull * 1024ull);
   }
   uint64_t cur_token = 0;
   bool matched = false;
@@ -969,6 +995,7 @@ Error Runner<T>::generate_from_prompt_or_file(
     const int32_t prompt_budget =
         prompt_processor_ar_len_ > 0 ? prompt_processor_ar_len_
                                      : static_cast<int32_t>(prompt_tokens.size());
+    auto build_input_start_ms = time_in_ms();
     const auto build_input_result = kv_store_->build_input(
         prompt_tokens,
         cur_pos_,
@@ -976,7 +1003,15 @@ Error Runner<T>::generate_from_prompt_or_file(
         selective_recompute_budget,
         prompt_budget,
         latency_ratio_,
-        recompute_ratio_);
+        recompute_ratio_,
+        enable_nonprefix_lcs_);
+    auto build_input_end_ms = time_in_ms();
+    printf(
+        "[Timing] build_input_ms=%ld prompt_len=%zu selective_budget=%d prompt_budget=%d\n",
+        build_input_end_ms - build_input_start_ms,
+        prompt_tokens.size(),
+        selective_recompute_budget,
+        prompt_budget);
     ET_LOG(
         Info,
         "build_input: cur_pos=%lld prompt_len=%zu selective_recompute_budget=%d prompt_budget=%d raw_matches=%zu segments=%zu merge_chunks=%zu recipes=%zu",
@@ -1046,117 +1081,249 @@ Error Runner<T>::generate_from_prompt_or_file(
       }
     }
 
-    auto rerotate_origin_slice =
-        [&](const LMStore::RecipeOrigin& origin, int64_t source_ori_pos) {
-          if constexpr (std::is_same<T, uint8_t>::value) {
-            const int32_t local_cur_start_pos = origin.cur_start_pos - cur_pos_;
-            const int64_t src_abs_pos = source_ori_pos + origin.ori_start_pos;
-            const int64_t dst_abs_pos = origin.cur_start_pos;
-            if (src_abs_pos == dst_abs_pos || origin.matched_len <= 0) {
-              return;
-            }
-            std::vector<float> rerotation_cos(
-                origin.matched_len * head_dim / 2);
-            std::vector<float> rerotation_sin(
-                origin.matched_len * head_dim / 2);
-            LMStore::compute_rerotation_cos_sin(
-                rope_freqs_cos_.data(),
-                rope_freqs_sin_.data(),
-                rerotation_cos.data(),
-                rerotation_sin.data(),
-                seq_len,
-                head_dim / 2,
-                src_abs_pos,
-                dst_abs_pos,
-                origin.matched_len);
-            for (int layer = 0; layer < num_layers; ++layer) {
-              ET_CHECK_MSG(
-                  kv_output_quant_attrs_.size() > static_cast<size_t>(layer * 2),
-                  "Missing KV quant attrs for layer %d",
-                  layer);
-              std::vector<uint8_t> k_compact(
-                  num_heads * head_dim * origin.matched_len);
-              for (int idx = 0; idx < num_heads * head_dim; ++idx) {
-                const uint8_t* src_ptr =
-                    reinterpret_cast<uint8_t*>(k_store[layer]) +
-                    idx * prompt_tokens.size() + local_cur_start_pos;
-                uint8_t* dst_ptr =
-                    k_compact.data() + idx * origin.matched_len;
-                std::memcpy(
-                    dst_ptr,
-                    src_ptr,
-                    origin.matched_len * sizeof(uint8_t));
-              }
-              LMStore::sq_per_tensor_params q_params{
-                  kv_output_quant_attrs_[layer * 2].scale,
-                  kv_output_quant_attrs_[layer * 2].zero_point};
-              LMStore::rerotate_k_u8(
-                  k_compact.data(),
-                  k_compact.data(),
-                  rerotation_cos.data(),
-                  rerotation_sin.data(),
-                  num_heads,
-                  origin.matched_len,
-                  head_dim,
-                  q_params,
-                  true);
-              for (int idx = 0; idx < num_heads * head_dim; ++idx) {
-                uint8_t* dst_ptr =
-                    reinterpret_cast<uint8_t*>(k_store[layer]) +
-                    idx * prompt_tokens.size() + local_cur_start_pos;
-                const uint8_t* src_ptr =
-                    k_compact.data() + idx * origin.matched_len;
-                std::memcpy(
-                    dst_ptr,
-                    src_ptr,
-                    origin.matched_len * sizeof(uint8_t));
-              }
-            }
+    auto get_row_pool_entry =
+        [&](int row_id, LMStore::CacheRowInfo* row_info) {
+          ET_CHECK_MSG(
+              kv_store_->get_row_info(row_id, row_info),
+              "Failed to read KV row metadata for row_id=%d",
+              row_id);
+          auto [hit, entry] = kv_pool_->get_or_create(row_id, row_info->prompt_len);
+          if (!hit) {
+            printf(
+                "[SQLiteKVLoad] row_id=%d prompt_len=%d chunk_start=%d\n",
+                row_id,
+                row_info->prompt_len,
+                row_info->chunk_start);
+            ET_CHECK_MSG(
+                kv_store_->read_row_cache(row_id, entry->k_ptrs, entry->v_ptrs),
+                "Failed to load KV row %d from SQLiteKVStore",
+                row_id);
           }
+          return std::make_pair(hit, entry);
         };
 
     auto load_origin_into_kv_cache = [&](const LMStore::RecipeOrigin& origin, bool is_blend=false, int64_t recipe_start_pos=0) {
       if (origin.type == LMStore::ChunkPromptType::kNew) {
         return;
       }
-      const int32_t local_cur_start_pos = origin.cur_start_pos - cur_pos_;
+      long row_fetch_ms = 0;
+      long slice_memcpy_ms = 0;
+      long rerotation_ms = 0;
+      long transfer_ms = 0;
       ET_LOG(Info, "Executing origin: row_id=%d cur_start=%d ori_start=%d len=%d type=%d",
         origin.row_id, origin.cur_start_pos, origin.ori_start_pos, 
         origin.matched_len, static_cast<int>(origin.type));
       int64_t source_ori_pos = 0;
       kv_store_->read_ori_pos(origin.row_id, &source_ori_pos);
-      kv_store_->transfer_cache(
-          k_store,
-          v_store,
+      LMStore::CacheRowInfo seed_row;
+      ET_CHECK_MSG(
+          kv_store_->get_row_info(origin.row_id, &seed_row),
+          "Failed to read seed KV row metadata for row_id=%d",
+          origin.row_id);
+      const int root_id =
+          seed_row.root_kv_id >= 0 ? seed_row.root_kv_id : seed_row.kv_id;
+      LMStore::CacheRowInfo row;
+      ET_CHECK_MSG(
+          kv_store_->get_row_info(root_id, &row),
+          "Failed to read root KV row metadata for row_id=%d",
+          root_id);
+      const int src_begin = origin.ori_start_pos;
+      const int src_end = origin.ori_start_pos + origin.matched_len;
+      while (true) {
+        const int row_begin = row.chunk_start;
+        const int row_end = row.chunk_start + row.prompt_len;
+        const int overlap_begin = std::max(src_begin, row_begin);
+        const int overlap_end = std::min(src_end, row_end);
+        if (overlap_begin < overlap_end) {
+          const int copy_len = overlap_end - overlap_begin;
+          const int src_offset_in_chunk = overlap_begin - row_begin;
+          const int dst_abs_start =
+              origin.cur_start_pos + (overlap_begin - src_begin);
+          const int dst_start =
+              is_blend ? dst_abs_start - recipe_start_pos : dst_abs_start;
+          auto row_fetch_start_ms = time_in_ms();
+          auto [hit, entry] = get_row_pool_entry(row.kv_id, &row);
+          auto row_fetch_end_ms = time_in_ms();
+          row_fetch_ms += row_fetch_end_ms - row_fetch_start_ms;
+          bool used_temp_buffers = false;
+          std::vector<std::vector<T>> temp_k;
+          std::vector<std::vector<T>> temp_v;
+          std::vector<T*> temp_k_ptrs;
+          std::vector<T*> temp_v_ptrs;
+          if constexpr (std::is_same<T, uint8_t>::value) {
+            if (origin.type == LMStore::ChunkPromptType::kNonPrefix &&
+                source_ori_pos + overlap_begin != dst_abs_start) {
+              used_temp_buffers = true;
+              temp_k.resize(num_layers);
+              temp_v.resize(num_layers);
+              temp_k_ptrs.resize(num_layers);
+              temp_v_ptrs.resize(num_layers);
+              auto rerotation_setup_start_ms = time_in_ms();
+              std::vector<float> rerotation_cos(copy_len * head_dim / 2);
+              std::vector<float> rerotation_sin(copy_len * head_dim / 2);
+#if defined(LMSTORE_HAS_FP16)
+              std::vector<LMStore::fp16_t> rerotation_cos_fp16;
+              std::vector<LMStore::fp16_t> rerotation_sin_fp16;
+              if (use_fp16_rerotation_) {
+                rerotation_cos_fp16.resize(copy_len * head_dim / 2);
+                rerotation_sin_fp16.resize(copy_len * head_dim / 2);
+                LMStore::compute_rerotation_cos_sin(
+                    rope_freqs_cos_fp16_.data(),
+                    rope_freqs_sin_fp16_.data(),
+                    rerotation_cos_fp16.data(),
+                    rerotation_sin_fp16.data(),
+                    seq_len,
+                    head_dim / 2,
+                    source_ori_pos + overlap_begin,
+                    dst_abs_start,
+                    copy_len);
+              } else
+#endif
+              {
+                LMStore::compute_rerotation_cos_sin(
+                    rope_freqs_cos_.data(),
+                    rope_freqs_sin_.data(),
+                    rerotation_cos.data(),
+                    rerotation_sin.data(),
+                    seq_len,
+                    head_dim / 2,
+                    source_ori_pos + overlap_begin,
+                    dst_abs_start,
+                    copy_len);
+              }
+              auto memcpy_start_ms = time_in_ms();
+              for (int layer = 0; layer < num_layers; ++layer) {
+                ET_CHECK_MSG(
+                    kv_output_quant_attrs_.size() >
+                        static_cast<size_t>(layer * 2),
+                    "Missing KV quant attrs for layer %d",
+                    layer);
+                temp_k[layer].resize(num_heads * head_dim * copy_len);
+                temp_v[layer].resize(num_heads * copy_len * head_dim);
+                temp_k_ptrs[layer] = temp_k[layer].data();
+                temp_v_ptrs[layer] = temp_v[layer].data();
+                for (int idx = 0; idx < num_heads * head_dim; ++idx) {
+                  const uint8_t* src_ptr =
+                      reinterpret_cast<const uint8_t*>(entry->k_ptrs[layer]) +
+                      idx * entry->seq_len + src_offset_in_chunk;
+                  uint8_t* dst_ptr =
+                      reinterpret_cast<uint8_t*>(temp_k_ptrs[layer]) +
+                      idx * copy_len;
+                  std::memcpy(dst_ptr, src_ptr, copy_len * sizeof(uint8_t));
+                }
+                for (int head = 0; head < num_heads; ++head) {
+                  const uint8_t* src_ptr =
+                      reinterpret_cast<const uint8_t*>(entry->v_ptrs[layer]) +
+                      head * entry->seq_len * head_dim +
+                      src_offset_in_chunk * head_dim;
+                  uint8_t* dst_ptr =
+                      reinterpret_cast<uint8_t*>(temp_v_ptrs[layer]) +
+                      head * copy_len * head_dim;
+                  std::memcpy(
+                      dst_ptr,
+                      src_ptr,
+                      copy_len * head_dim * sizeof(uint8_t));
+                }
+              }
+              auto memcpy_end_ms = time_in_ms();
+              slice_memcpy_ms += memcpy_end_ms - memcpy_start_ms;
+              auto rerotation_start_ms = time_in_ms();
+              for (int layer = 0; layer < num_layers; ++layer) {
+                LMStore::sq_per_tensor_params q_params{
+                    kv_output_quant_attrs_[layer * 2].scale,
+                    kv_output_quant_attrs_[layer * 2].zero_point};
+                if (use_fp16_rerotation_) {
+#if defined(LMSTORE_HAS_FP16)
+                  LMStore::rerotate_k_u8_fp16(
+                      reinterpret_cast<uint8_t*>(temp_k_ptrs[layer]),
+                      reinterpret_cast<uint8_t*>(temp_k_ptrs[layer]),
+                      rerotation_cos_fp16.data(),
+                      rerotation_sin_fp16.data(),
+                      num_heads,
+                      copy_len,
+                      head_dim,
+                      q_params,
+                      true);
+#else
+                  LMStore::rerotate_k_u8(
+                      reinterpret_cast<uint8_t*>(temp_k_ptrs[layer]),
+                      reinterpret_cast<uint8_t*>(temp_k_ptrs[layer]),
+                      rerotation_cos.data(),
+                      rerotation_sin.data(),
+                      num_heads,
+                      copy_len,
+                      head_dim,
+                      q_params,
+                      true);
+#endif
+                } else {
+                  LMStore::rerotate_k_u8(
+                      reinterpret_cast<uint8_t*>(temp_k_ptrs[layer]),
+                      reinterpret_cast<uint8_t*>(temp_k_ptrs[layer]),
+                      rerotation_cos.data(),
+                      rerotation_sin.data(),
+                      num_heads,
+                      copy_len,
+                      head_dim,
+                      q_params,
+                      true);
+                }
+              }
+              auto rerotation_end_ms = time_in_ms();
+              rerotation_ms +=
+                  (memcpy_start_ms - rerotation_setup_start_ms) +
+                  (rerotation_end_ms - rerotation_start_ms);
+            }
+          }
+          auto& k_src = used_temp_buffers ? temp_k_ptrs : entry->k_ptrs;
+          auto& v_src = used_temp_buffers ? temp_v_ptrs : entry->v_ptrs;
+          const int src_seq_len = used_temp_buffers ? copy_len : entry->seq_len;
+          const int src_offset = used_temp_buffers ? 0 : src_offset_in_chunk;
+          auto transfer_start_ms = time_in_ms();
+          if (!is_blend) {
+            kv_manager_->transfer_cache(
+                k_src,
+                v_src,
+                src_seq_len,
+                copy_len,
+                copy_len,
+                false,
+                src_offset,
+                dst_start);
+          } else {
+            kv_manager_->transfer_cache_blend(
+                k_src,
+                v_src,
+                src_seq_len,
+                copy_len,
+                copy_len,
+                blender_prompt_processor_ar_len_,
+                src_offset,
+                dst_start);
+          }
+          auto transfer_end_ms = time_in_ms();
+          transfer_ms += transfer_end_ms - transfer_start_ms;
+          if (!used_temp_buffers && !hit) {
+            slice_memcpy_ms += 0;
+          }
+        }
+        if (row.succ_kv_id < 0 || overlap_end >= src_end) {
+          break;
+        }
+        ET_CHECK_MSG(
+            kv_store_->get_row_info(row.succ_kv_id, &row),
+            "Failed to read next KV row metadata for row_id=%d",
+            row.succ_kv_id);
+      }
+      printf(
+          "[LoadBreakdown] row_id=%d type=%d fetch_ms=%ld slice_memcpy_ms=%ld rerotation_ms=%ld transfer_ms=%ld total_ms=%ld\n",
           origin.row_id,
-          origin.ori_start_pos,
-          local_cur_start_pos,
-          origin.matched_len,
-          prompt_tokens.size());
-      if (origin.type == LMStore::ChunkPromptType::kNonPrefix) {
-        rerotate_origin_slice(origin, source_ori_pos);
-      }
-      if (!is_blend) {
-        kv_manager_->transfer_cache(
-            k_store,
-            v_store,
-            prompt_tokens.size(),
-            origin.matched_len,
-            origin.matched_len,
-            false,
-            local_cur_start_pos,
-            origin.cur_start_pos);
-      } else {
-        kv_manager_->transfer_cache_blend(
-            k_store,
-            v_store,
-            prompt_tokens.size(),
-            origin.matched_len,
-            origin.matched_len,
-            blender_prompt_processor_ar_len_,
-            local_cur_start_pos,
-            origin.cur_start_pos - recipe_start_pos);
-      }
+          static_cast<int>(origin.type),
+          row_fetch_ms,
+          slice_memcpy_ms,
+          rerotation_ms,
+          transfer_ms,
+          row_fetch_ms + slice_memcpy_ms + rerotation_ms + transfer_ms);
     };
 
     if (!build_input_result.recipes.empty()) {
@@ -1176,10 +1343,16 @@ Error Runner<T>::generate_from_prompt_or_file(
           first_recipe.origins.size());
 
       if (full_prefix_match) {
+        auto full_prefix_load_start_ms = time_in_ms();
         load_origin_into_kv_cache(first_recipe.origins[0]);
+        auto full_prefix_load_end_ms = time_in_ms();
         ET_CHECK_MSG(
             kv_store_->read_next_token(first_recipe.origins[0].row_id, &cur_token),
             "Failed to read next token for full-prefix hit.");
+        printf(
+            "[Timing] full_prefix_load_ms=%ld next_token_read_ms=%ld\n",
+            full_prefix_load_end_ms - full_prefix_load_start_ms,
+            time_in_ms() - full_prefix_load_end_ms);
         matched = true;
       } else {
         for (const auto& recipe : build_input_result.recipes) {
@@ -1198,6 +1371,11 @@ Error Runner<T>::generate_from_prompt_or_file(
             }
             auto prefix_end_time = time_in_ms();
             ET_LOG(Info, "Prefix reuse took %ld ms", prefix_end_time - prefix_start_time);
+            printf(
+                "[Timing] recipe_start=%d recipe_end=%d graph_type=prefix_reuse load_ms=%ld\n",
+                recipe.start,
+                recipe.end,
+                prefix_end_time - prefix_start_time);
             continue;
           }
 
@@ -1206,15 +1384,18 @@ Error Runner<T>::generate_from_prompt_or_file(
               prompt_tokens.begin() + (recipe.end - cur_pos_) + 1);
           const int64_t chunk_start_pos = recipe.start;
           if (recipe.group == LMStore::ChunkGraphType::kSelectiveRecompute) {
+            auto selective_load_start_ms = time_in_ms();
             for (const auto& origin : recipe.origins) {
               load_origin_into_kv_cache(origin, true, recipe.start);
             }
+            auto selective_load_end_ms = time_in_ms();
             std::vector<int32_t> valid_mask(blender_prompt_processor_ar_len_, 0);
             for (int i = 0;
                 i < static_cast<int>(chunk_tokens.size()) &&
                 i < static_cast<int>(valid_mask.size()); ++i) {
               valid_mask[i] = 1;
             }
+            auto selective_compute_start_ms = time_in_ms();
             auto prefill_res = blender_prompt_processor_->prefill(
                 chunk_tokens,
                 chunk_start_pos,
@@ -1222,14 +1403,28 @@ Error Runner<T>::generate_from_prompt_or_file(
                 valid_mask.data(),
                 attention_sink_rope_runner_.get());
             ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+            auto selective_compute_end_ms = time_in_ms();
+            printf(
+                "[Timing] recipe_start=%d recipe_end=%d graph_type=selective_recompute load_ms=%ld compute_ms=%ld\n",
+                recipe.start,
+                recipe.end,
+                selective_load_end_ms - selective_load_start_ms,
+                selective_compute_end_ms - selective_compute_start_ms);
             cur_token = prefill_res.get();
           } else {
+            auto prompt_compute_start_ms = time_in_ms();
             auto prefill_res = prompt_processor_->prefill(
                 chunk_tokens,
                 chunk_start_pos,
                 dump_logits,
                 attention_sink_rope_runner_.get());
             ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+            auto prompt_compute_end_ms = time_in_ms();
+            printf(
+                "[Timing] recipe_start=%d recipe_end=%d graph_type=prompt compute_ms=%ld\n",
+                recipe.start,
+                recipe.end,
+                prompt_compute_end_ms - prompt_compute_start_ms);
             cur_token = prefill_res.get();
           }
         }
@@ -1237,9 +1432,14 @@ Error Runner<T>::generate_from_prompt_or_file(
     }
   } else {
     // prefill inference
+    auto prompt_compute_start_ms = time_in_ms();
     auto prefill_res = prompt_processor_->prefill(
           prompt_tokens, cur_pos_, dump_logits, attention_sink_rope_runner_.get());
     ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+    auto prompt_compute_end_ms = time_in_ms();
+    printf(
+        "[Timing] full_prompt_prefill_ms=%ld\n",
+        prompt_compute_end_ms - prompt_compute_start_ms);
     cur_token = prefill_res.get();
   }
   stats_.first_token_ms = time_in_ms();
@@ -1249,16 +1449,35 @@ Error Runner<T>::generate_from_prompt_or_file(
     ET_LOG(
       Info,
       "Storing KV caches to disk...\n");
-    kv_manager_->transfer_cache(k_store, v_store, prompt_tokens.size(),
-        prompt_tokens.size(), prompt_tokens.size(), true);
+    auto store_kv_start_ms = time_in_ms();
+    std::vector<LMStore::CacheRowInfo> rows;
     ET_CHECK_MSG(
-        kv_store_->store_prompt_cache(
-            prompt_tokens, cur_token, cur_pos_, k_store, v_store),
-        "Failed to store KV cache into SQLiteKVStore.");
-  }
-  for (int j = 0; j < num_layers; ++j) {
-    free(k_store[j]);
-    free(v_store[j]);
+        kv_store_->prepare_prompt_cache_rows(
+            prompt_tokens, cur_token, cur_pos_, &rows),
+        "Failed to prepare KV cache rows in SQLiteKVStore.");
+    for (const auto& row : rows) {
+      auto entry_result = kv_pool_->get_or_create(row.kv_id, row.prompt_len);
+      auto* entry = entry_result.second;
+      kv_manager_->transfer_cache(
+          entry->k_ptrs,
+          entry->v_ptrs,
+          row.prompt_len,
+          row.prompt_len,
+          prompt_tokens.size(),
+          true,
+          0,
+          row.chunk_start);
+      ET_CHECK_MSG(
+          kv_store_->write_row_cache(
+              row.kv_id, row.prompt_len, entry->k_ptrs, entry->v_ptrs),
+          "Failed to write KV cache row %d to SQLiteKVStore.",
+          row.kv_id);
+    }
+    auto store_kv_end_ms = time_in_ms();
+    printf(
+        "[Timing] store_kv_ms=%ld rows=%zu\n",
+        store_kv_end_ms - store_kv_start_ms,
+        rows.size());
   }
   cur_pos_ += num_prompt_tokens;
 

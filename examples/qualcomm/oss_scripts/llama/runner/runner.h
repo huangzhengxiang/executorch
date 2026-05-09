@@ -31,6 +31,8 @@
 #include <executorch/extension/module/module.h>
 #include <executorch/runtime/core/event_tracer.h>
 #include <pytorch/tokenizers/tokenizer.h>
+#include <ops/ops.h>
+#include <CPUKVPool.h>
 #include <NaiveKVStore.h>
 #include <SQLiteKVStore.h>
 
@@ -89,11 +91,15 @@ class Runner : public executorch::extension::llm::IRunner {
       const int blend_len = 0,
       const float latency_ratio = 0.2f,
       const float recompute_ratio = 0.25f,
+      const bool enable_nonprefix_lcs = true,
+      const bool use_fp16_rerotation = false,
+      const uint64_t cpu_kv_pool_size_mb = 512,
       const bool separate_embed = false,
       const std::string& embedding_matrix_path = "",
       const std::string& rope_config_path = "",
       torch::executor::EventTracer* event_tracer = nullptr,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
+      std::shared_ptr<LMStore::CPUKVPool<T>> kv_pool = nullptr,
       std::unique_ptr<executorch::extension::Module>
           attention_sink_rope_module = nullptr);
 
@@ -116,6 +122,9 @@ class Runner : public executorch::extension::llm::IRunner {
   void stop() override {};
   void reset() override;
   executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version();
+  std::shared_ptr<LMStore::CPUKVPool<T>> get_kv_pool() const {
+    return kv_pool_;
+  }
   executorch::runtime::Error export_kv_snapshot(KVSnapshot* snapshot);
   executorch::runtime::Error import_kv_snapshot(const KVSnapshot& snapshot);
 
@@ -148,6 +157,9 @@ class Runner : public executorch::extension::llm::IRunner {
   int blend_len_{0};
   float latency_ratio_{0.2f};
   float recompute_ratio_{0.25f};
+  bool enable_nonprefix_lcs_{true};
+  bool use_fp16_rerotation_{false};
+  uint64_t cpu_kv_pool_size_mb_{512};
   bool separate_embed_{false};
   std::string embedding_matrix_path_;
   std::string rope_config_path_;
@@ -175,6 +187,7 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<KVManager<T>> kv_manager_;
   // std::unique_ptr<LMStore::NaiveKVStore<T>> kv_store_;
   std::unique_ptr<LMStore::SQLiteKVStore<T>> kv_store_;
+  std::shared_ptr<LMStore::CPUKVPool<T>> kv_pool_;
   std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
   std::unique_ptr<DecoderRunner> decoder_runner_;
   std::unique_ptr<AttentionSinkRopeRunner> attention_sink_rope_runner_;
@@ -183,6 +196,10 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<TokenGenerator<T>> token_generator_;
   std::vector<float> rope_freqs_cos_;
   std::vector<float> rope_freqs_sin_;
+#if defined(LMSTORE_HAS_FP16)
+  std::vector<LMStore::fp16_t> rope_freqs_cos_fp16_;
+  std::vector<LMStore::fp16_t> rope_freqs_sin_fp16_;
+#endif
   std::vector<KvQuantAttr> kv_output_quant_attrs_;
   SeparateEmbedding separate_embedding_;
   void load_kv_quant_attrs();

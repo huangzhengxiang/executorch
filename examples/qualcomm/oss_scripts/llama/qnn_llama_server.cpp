@@ -99,6 +99,18 @@ DEFINE_double(
     0.25,
     "Selective recompute reuse ratio passed to KVStore build_input().");
 DEFINE_bool(
+    enable_nonprefix_lcs,
+    true,
+    "Whether to enable non-prefix approximate LCS matching in KVStore build_input().");
+DEFINE_bool(
+    fp16,
+    false,
+    "Use fp16 rerotation path for non-prefix selective recompute.");
+DEFINE_uint64(
+    cpu_kv_pool_mb,
+    512,
+    "CPU KV pool size in MB used to cache row chunks before falling back to SQLite.");
+DEFINE_bool(
     separate_embed,
     false,
     "Enable separate embedding runtime path.");
@@ -695,9 +707,13 @@ int start_server(
       FLAGS_blend_len,
       static_cast<float>(FLAGS_latency_ratio),
       static_cast<float>(FLAGS_recompute_ratio),
+      FLAGS_enable_nonprefix_lcs,
+      FLAGS_fp16,
+      FLAGS_cpu_kv_pool_mb,
       FLAGS_separate_embed,
       FLAGS_embedding_matrix_path.c_str(),
       FLAGS_rope_config_path.c_str(),
+      nullptr,
       nullptr,
       nullptr,
       std::move(attention_sink_rope_module));

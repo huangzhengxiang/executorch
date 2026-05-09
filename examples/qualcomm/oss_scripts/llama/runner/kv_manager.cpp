@@ -557,9 +557,86 @@ void KVManager<T>::blender_update_key(
   write_ptr = k_cache.buffer + past_size;
   read_ptr = k_cache.output_buffer;
   const int32_t out_size = blend_len;
+  const int32_t* idx_ptr = imp_indices;
   for (int i = 0; i < n_iter; ++i) {
-    for (int j = 0; j < blend_len; ++j) {
-      write_ptr[imp_indices[j]] = read_ptr[j];
+    int j = 0;
+    for (; j + 8 <= blend_len; j += 8) {
+#if defined(__AVX2__)
+      alignas(32) int32_t idx_buf[8];
+      __m256i idx_vec = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(idx_ptr + j));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(idx_buf), idx_vec);
+      if constexpr (std::is_same<T, uint8_t>::value) {
+        alignas(16) uint8_t read_buf[8];
+        __m128i read_vec = _mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(read_ptr + j));
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(read_buf), read_vec);
+        write_ptr[idx_buf[0]] = read_buf[0];
+        write_ptr[idx_buf[1]] = read_buf[1];
+        write_ptr[idx_buf[2]] = read_buf[2];
+        write_ptr[idx_buf[3]] = read_buf[3];
+        write_ptr[idx_buf[4]] = read_buf[4];
+        write_ptr[idx_buf[5]] = read_buf[5];
+        write_ptr[idx_buf[6]] = read_buf[6];
+        write_ptr[idx_buf[7]] = read_buf[7];
+      } else if constexpr (std::is_same<T, uint16_t>::value) {
+        alignas(16) uint16_t read_buf[8];
+        __m128i read_vec = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(read_ptr + j));
+        _mm_store_si128(reinterpret_cast<__m128i*>(read_buf), read_vec);
+        write_ptr[idx_buf[0]] = read_buf[0];
+        write_ptr[idx_buf[1]] = read_buf[1];
+        write_ptr[idx_buf[2]] = read_buf[2];
+        write_ptr[idx_buf[3]] = read_buf[3];
+        write_ptr[idx_buf[4]] = read_buf[4];
+        write_ptr[idx_buf[5]] = read_buf[5];
+        write_ptr[idx_buf[6]] = read_buf[6];
+        write_ptr[idx_buf[7]] = read_buf[7];
+      }
+#elif defined(__NEON__)
+      int32x4_t idx_vec0 = vld1q_s32(idx_ptr + j);
+      int32x4_t idx_vec1 = vld1q_s32(idx_ptr + j + 4);
+      int32_t idx_buf[8];
+      vst1q_s32(idx_buf, idx_vec0);
+      vst1q_s32(idx_buf + 4, idx_vec1);
+      if constexpr (std::is_same<T, uint8_t>::value) {
+        uint8x8_t read_vec = vld1_u8(read_ptr + j);
+        uint8_t read_buf[8];
+        vst1_u8(read_buf, read_vec);
+        write_ptr[idx_buf[0]] = read_buf[0];
+        write_ptr[idx_buf[1]] = read_buf[1];
+        write_ptr[idx_buf[2]] = read_buf[2];
+        write_ptr[idx_buf[3]] = read_buf[3];
+        write_ptr[idx_buf[4]] = read_buf[4];
+        write_ptr[idx_buf[5]] = read_buf[5];
+        write_ptr[idx_buf[6]] = read_buf[6];
+        write_ptr[idx_buf[7]] = read_buf[7];
+      } else if constexpr (std::is_same<T, uint16_t>::value) {
+        uint16x8_t read_vec = vld1q_u16(read_ptr + j);
+        uint16_t read_buf[8];
+        vst1q_u16(read_buf, read_vec);
+        write_ptr[idx_buf[0]] = read_buf[0];
+        write_ptr[idx_buf[1]] = read_buf[1];
+        write_ptr[idx_buf[2]] = read_buf[2];
+        write_ptr[idx_buf[3]] = read_buf[3];
+        write_ptr[idx_buf[4]] = read_buf[4];
+        write_ptr[idx_buf[5]] = read_buf[5];
+        write_ptr[idx_buf[6]] = read_buf[6];
+        write_ptr[idx_buf[7]] = read_buf[7];
+      }
+#else
+      write_ptr[idx_ptr[j + 0]] = read_ptr[j + 0];
+      write_ptr[idx_ptr[j + 1]] = read_ptr[j + 1];
+      write_ptr[idx_ptr[j + 2]] = read_ptr[j + 2];
+      write_ptr[idx_ptr[j + 3]] = read_ptr[j + 3];
+      write_ptr[idx_ptr[j + 4]] = read_ptr[j + 4];
+      write_ptr[idx_ptr[j + 5]] = read_ptr[j + 5];
+      write_ptr[idx_ptr[j + 6]] = read_ptr[j + 6];
+      write_ptr[idx_ptr[j + 7]] = read_ptr[j + 7];
+#endif
+    }
+    for (; j < blend_len; ++j) {
+      write_ptr[idx_ptr[j]] = read_ptr[j];
     }
     // for (int j = 0; j < blend_len; ++j) {
     //   ET_LOG(Info, "kv_caches[%d, %d]: %d", i, j, (int)write_ptr[j]);

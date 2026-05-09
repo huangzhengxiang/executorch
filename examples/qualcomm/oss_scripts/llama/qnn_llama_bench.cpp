@@ -98,6 +98,18 @@ DEFINE_double(
     0.25,
     "Selective recompute reuse ratio passed to KVStore build_input().");
 DEFINE_bool(
+    enable_nonprefix_lcs,
+    true,
+    "Whether to enable non-prefix approximate LCS matching in KVStore build_input().");
+DEFINE_bool(
+    fp16,
+    false,
+    "Use fp16 rerotation path for non-prefix selective recompute.");
+DEFINE_uint64(
+    cpu_kv_pool_mb,
+    512,
+    "CPU KV pool size in MB used to cache row chunks before falling back to SQLite.");
+DEFINE_bool(
     separate_embed,
     false,
     "Enable separate embedding runtime path (embedding is loaded from matrix file and fed as decoder input).");
@@ -123,6 +135,14 @@ DEFINE_uint64(
     prompt_token_seed,
     0,
     "Seed for benchmark prompt token generation. 0 uses nondeterministic seeding; non-zero makes prompt tokens reproducible.");
+DEFINE_string(
+    prefix_hit_ratios,
+    "",
+    "Comma-separated prefix hit ratios in percent for prefix-KV-reuse benchmarking (e.g. 25,50,75,100).");
+DEFINE_string(
+    nonprefix_hit_ratios,
+    "",
+    "Comma-separated non-prefix hit ratios in percent. Each warmup prompt is total_len+128 tokens: the first 128 tokens match, tokens [128,256) differ, and a continuous suffix-region hit is injected after the gap.");
 DEFINE_string(
     output_path,
     "qnn_llama_bench.csv",
@@ -199,6 +219,29 @@ std::vector<int32_t> parse_int_list(
   return values;
 }
 
+std::vector<int32_t> parse_percent_list(
+    const std::string& csv,
+    const char* flag_name) {
+  std::vector<int32_t> values = parse_int_list(csv, flag_name, true);
+  for (int32_t value : values) {
+    ET_CHECK_MSG(
+        value >= 0 && value <= 100,
+        "Value '%d' in --%s must be within [0, 100]",
+        value,
+        flag_name);
+  }
+  return values;
+}
+
+std::vector<int32_t> parse_optional_percent_list(
+    const std::string& csv,
+    const char* flag_name) {
+  if (trim(csv).empty()) {
+    return {};
+  }
+  return parse_percent_list(csv, flag_name);
+}
+
 int32_t infer_vocab_size(executorch::extension::Module* module) {
   auto method_meta = module->method_meta("kv_forward");
   ET_CHECK_MSG(
@@ -225,27 +268,16 @@ class BenchTokenizer final : public tokenizers::Tokenizer {
       std::numeric_limits<uint64_t>::max() - 1;
 
   BenchTokenizer(
-      int32_t prefill_len,
       uint64_t dummy_token_id,
-      uint64_t prompt_token_seed,
-      int32_t vocab_size)
-      : prefill_len_(prefill_len),
-        dummy_token_id_(dummy_token_id),
-        vocab_size_limit_(vocab_size) {
+      int32_t vocab_size,
+      std::vector<uint64_t> prompt_tokens)
+      : dummy_token_id_(dummy_token_id),
+        vocab_size_limit_(vocab_size),
+        prompt_tokens_(std::move(prompt_tokens)) {
     initialized_ = true;
     vocab_size_ = vocab_size_limit_;
     bos_tok_ = dummy_token_id_;
     eos_tok_ = kEosSentinel;
-
-    ET_CHECK_MSG(vocab_size_limit_ > 1, "Invalid vocab size %d", vocab_size_limit_);
-    std::mt19937_64 rng(
-        prompt_token_seed == 0 ? std::random_device{}() : prompt_token_seed);
-    std::uniform_int_distribution<uint64_t> dist(
-        0, static_cast<uint64_t>(vocab_size_limit_ - 1));
-    prompt_tokens_.reserve(static_cast<size_t>(prefill_len_));
-    for (int32_t i = 0; i < prefill_len_; ++i) {
-      prompt_tokens_.push_back(dist(rng));
-    }
   }
 
   tokenizers::Error load(const std::string&) override {
@@ -275,11 +307,48 @@ class BenchTokenizer final : public tokenizers::Tokenizer {
   }
 
  private:
-  int32_t prefill_len_;
   uint64_t dummy_token_id_;
   int32_t vocab_size_limit_;
   std::vector<uint64_t> prompt_tokens_;
 };
+
+uint64_t next_prompt_seed(uint64_t base_seed) {
+  static uint64_t call_index = 0;
+  ++call_index;
+  if (base_seed == 0) {
+    return (static_cast<uint64_t>(std::random_device{}()) << 32) ^
+        static_cast<uint64_t>(std::random_device{}()) ^ call_index;
+  }
+  return base_seed + call_index;
+}
+
+std::vector<uint64_t> build_random_prompt_tokens(
+    int32_t prompt_len,
+    int32_t vocab_size,
+    uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<uint64_t> dist(
+      0, static_cast<uint64_t>(vocab_size - 1));
+  std::vector<uint64_t> tokens;
+  tokens.reserve(static_cast<size_t>(prompt_len));
+  for (int32_t i = 0; i < prompt_len; ++i) {
+    tokens.push_back(dist(rng));
+  }
+  return tokens;
+}
+
+uint64_t sample_token_excluding(
+    std::mt19937_64* rng,
+    int32_t vocab_size,
+    uint64_t forbidden) {
+  std::uniform_int_distribution<uint64_t> dist(
+      0, static_cast<uint64_t>(vocab_size - 1));
+  uint64_t token = dist(*rng);
+  while (token == forbidden) {
+    token = dist(*rng);
+  }
+  return token;
+}
 
 struct Sample {
   double prefill_ms;
@@ -287,8 +356,7 @@ struct Sample {
   double total_ms;
   double prefill_tok_per_s;
   double decode_tok_per_s;
-  double total_tok_per_s;
-  double ttfb_ms;
+  double ttft_ms;
 };
 
 struct Aggregate {
@@ -298,8 +366,7 @@ struct Aggregate {
   double total_ms{0.0};
   double prefill_tok_per_s{0.0};
   double decode_tok_per_s{0.0};
-  double total_tok_per_s{0.0};
-  double ttfb_ms{0.0};
+  double ttft_ms{0.0};
 
   void add(const Sample& sample) {
     count++;
@@ -308,8 +375,7 @@ struct Aggregate {
     total_ms += sample.total_ms;
     prefill_tok_per_s += sample.prefill_tok_per_s;
     decode_tok_per_s += sample.decode_tok_per_s;
-    total_tok_per_s += sample.total_tok_per_s;
-    ttfb_ms += sample.ttfb_ms;
+    ttft_ms += sample.ttft_ms;
   }
 
   Sample average() const {
@@ -320,13 +386,16 @@ struct Aggregate {
         total_ms / count,
         prefill_tok_per_s / count,
         decode_tok_per_s / count,
-        total_tok_per_s / count,
-        ttfb_ms / count};
+        ttft_ms / count};
   }
 };
 
 template <typename T>
-Sample run_single(int32_t prefill_len, int32_t generation_len) {
+Sample run_single(
+    const std::vector<uint64_t>& prompt_tokens,
+    int32_t generation_len,
+    int32_t vocab_size,
+    std::shared_ptr<LMStore::CPUKVPool<T>>* kv_pool = nullptr) {
   auto module = std::make_unique<executorch::extension::Module>(
       FLAGS_model_path.c_str(),
       executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
@@ -339,13 +408,11 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
                 MmapUseMlockIgnoreErrors);
   }
 
-  const int32_t vocab_size = infer_vocab_size(module.get());
   auto tokenizer =
       std::make_unique<BenchTokenizer>(
-          prefill_len,
           FLAGS_dummy_token_id,
-          FLAGS_prompt_token_seed,
-          vocab_size);
+          vocab_size,
+          prompt_tokens);
   // Keep the parameter ordering aligned with qnn_llama_runner.cpp.
   example::Runner<T> runner(
       std::move(module),
@@ -365,15 +432,19 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
       FLAGS_blend_len,
       static_cast<float>(FLAGS_latency_ratio),
       static_cast<float>(FLAGS_recompute_ratio),
+      FLAGS_enable_nonprefix_lcs,
+      FLAGS_fp16,
+      FLAGS_cpu_kv_pool_mb,
       FLAGS_separate_embed,
       FLAGS_embedding_matrix_path.c_str(),
       FLAGS_rope_config_path.c_str(),
       nullptr,
       std::move(tokenizer),
+      kv_pool ? *kv_pool : nullptr,
       std::move(attention_sink_rope_module));
 
   ET_CHECK_MSG(
-      static_cast<int64_t>(prefill_len) + generation_len + 1 <=
+      static_cast<int64_t>(prompt_tokens.size()) + generation_len + 1 <=
           std::numeric_limits<int32_t>::max(),
       "prefill_len + generation_len is too large");
   executorch::extension::llm::GenerationConfig config{
@@ -381,7 +452,7 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
       true,
       generation_len,
       false,
-      prefill_len + generation_len + 1,
+      static_cast<int32_t>(prompt_tokens.size()) + generation_len + 1,
       static_cast<float>(FLAGS_temperature),
       0,
       0};
@@ -419,82 +490,259 @@ Sample run_single(int32_t prefill_len, int32_t generation_len) {
       static_cast<int>(err));
   ET_CHECK_MSG(got_stats, "Failed to collect benchmark stats");
   ET_CHECK_MSG(
-      stats.num_prompt_tokens == prefill_len,
+      stats.num_prompt_tokens == static_cast<int64_t>(prompt_tokens.size()),
       "Prefill length mismatch (requested %d, got %ld)",
-      prefill_len,
+      static_cast<int>(prompt_tokens.size()),
       stats.num_prompt_tokens);
   ET_CHECK_MSG(
       stats.num_generated_tokens == generation_len,
       "Decode step mismatch (requested %d, got %ld). Ensure seq_len fits model context or use attention sink.",
       generation_len,
       stats.num_generated_tokens);
+  if (kv_pool) {
+    *kv_pool = runner.get_kv_pool();
+  }
 
   const double prefill_ms = stats.prompt_eval_end_ms - stats.inference_start_ms;
-  const double decode_ms = stats.inference_end_ms - stats.prompt_eval_end_ms;
+  const double decode_ms = stats.inference_end_ms - stats.first_token_ms;
   const double total_ms = stats.inference_end_ms - stats.inference_start_ms;
-  const double ttfb_ms = stats.first_token_ms - stats.inference_start_ms;
+  const double ttft_ms = stats.first_token_ms - stats.inference_start_ms;
+  const int64_t generation_only_tokens =
+      std::max<int64_t>(0, stats.num_generated_tokens - 1);
 
   return Sample{
       prefill_ms,
       decode_ms,
       total_ms,
-      safe_rate(prefill_len, prefill_ms),
-      safe_rate(generation_len, decode_ms),
-      safe_rate(generation_len, total_ms),
-      ttfb_ms};
+      safe_rate(prompt_tokens.size(), prefill_ms),
+      safe_rate(generation_only_tokens, decode_ms),
+      ttft_ms};
+}
+
+template <typename T>
+Sample run_single_with_prefix_hit(
+    int32_t prefill_len,
+    int32_t generation_len,
+    int32_t prefix_hit_ratio,
+    int32_t vocab_size) {
+  const uint64_t seed = next_prompt_seed(FLAGS_prompt_token_seed);
+  const std::vector<uint64_t> full_prompt_tokens =
+      build_random_prompt_tokens(prefill_len, vocab_size, seed);
+  const int32_t prefix_len = static_cast<int32_t>(
+      (static_cast<int64_t>(prefill_len) * prefix_hit_ratio) / 100);
+  if (prefix_len <= 0) {
+    return run_single<T>(full_prompt_tokens, generation_len, vocab_size);
+  }
+  std::vector<uint64_t> prefix_prompt_tokens(
+      full_prompt_tokens.begin(), full_prompt_tokens.begin() + prefix_len);
+  std::shared_ptr<LMStore::CPUKVPool<T>> kv_pool;
+  (void)run_single<T>(prefix_prompt_tokens, 0, vocab_size, &kv_pool);
+  return run_single<T>(full_prompt_tokens, generation_len, vocab_size, &kv_pool);
+}
+
+template <typename T>
+Sample run_single_with_nonprefix_hit(
+    int32_t prefill_len,
+    int32_t generation_len,
+    int32_t nonprefix_hit_ratio,
+    int32_t vocab_size) {
+  ET_CHECK_MSG(
+      prefill_len > 128,
+      "non-prefix reuse benchmark requires prefill_len > 128, got %d",
+      prefill_len);
+  const uint64_t seed = next_prompt_seed(FLAGS_prompt_token_seed);
+  const std::vector<uint64_t> full_prompt_tokens =
+      build_random_prompt_tokens(prefill_len, vocab_size, seed);
+  const int32_t tail_len = prefill_len - 128;
+  const int32_t hit_len = static_cast<int32_t>(
+      (static_cast<int64_t>(tail_len) * nonprefix_hit_ratio) / 100);
+  if (hit_len <= 0) {
+    return run_single<T>(full_prompt_tokens, generation_len, vocab_size);
+  }
+  std::vector<uint64_t> warm_prompt_tokens;
+  warm_prompt_tokens.reserve(static_cast<size_t>(prefill_len + 128));
+  warm_prompt_tokens.insert(
+      warm_prompt_tokens.end(), full_prompt_tokens.begin(), full_prompt_tokens.begin() + 128);
+
+  std::mt19937_64 rng(seed ^ 0x9e3779b97f4a7c15ULL);
+  for (int32_t i = 0; i < 128; ++i) {
+    const uint64_t forbidden =
+        full_prompt_tokens[static_cast<size_t>(i) % full_prompt_tokens.size()];
+    warm_prompt_tokens.push_back(
+        sample_token_excluding(&rng, vocab_size, forbidden));
+  }
+  warm_prompt_tokens.insert(
+      warm_prompt_tokens.end(),
+      full_prompt_tokens.begin() + 128,
+      full_prompt_tokens.begin() + 128 + hit_len);
+  for (int32_t i = hit_len; i < tail_len; ++i) {
+    warm_prompt_tokens.push_back(
+        sample_token_excluding(&rng, vocab_size, full_prompt_tokens[128 + i]));
+  }
+
+  std::shared_ptr<LMStore::CPUKVPool<T>> kv_pool;
+  (void)run_single<T>(warm_prompt_tokens, 0, vocab_size, &kv_pool);
+  return run_single<T>(full_prompt_tokens, generation_len, vocab_size, &kv_pool);
 }
 
 template <typename T>
 void run_benchmarks(
     const std::vector<int32_t>& prefill_lengths,
-    const std::vector<int32_t>& generation_lengths) {
+    const std::vector<int32_t>& generation_lengths,
+    const std::vector<int32_t>& prefix_hit_ratios,
+    const std::vector<int32_t>& nonprefix_hit_ratios,
+    int32_t vocab_size) {
   std::ofstream out(FLAGS_output_path.c_str());
   ET_CHECK_MSG(
       out.is_open(),
       "Failed to open output csv path: %s",
       FLAGS_output_path.c_str());
-  out << "prefill_len,generation_len,avg_prefill_ms,avg_decode_ms,avg_total_ms,"
-         "avg_ttfb_ms,avg_prefill_tok_per_s,avg_decode_tok_per_s,"
-         "avg_end_to_end_decode_tok_per_s\n";
+  out << "reuse_type,prefill_len,prefix_len,hit_len,hit_ratio,generation_len,avg_prefill_ms,avg_decode_ms,avg_total_ms,"
+         "avg_ttft_ms,avg_prefill_tok_per_s,avg_decode_tok_per_s\n";
 
   printf(
-      "%10s %14s %14s %14s %14s %18s %18s %18s\n",
+      "%12s %10s %12s %10s %10s %14s %14s %14s %14s %18s %18s %18s\n",
+      "reuse_type",
       "prefill",
+      "prefix_len",
+      "hit_len",
+      "hit_ratio",
       "generation",
       "prefill_ms",
       "decode_ms",
       "total_ms",
-      "ttfb_ms",
+      "ttft_ms",
       "prefill_tok/s",
       "decode_tok/s");
+  const bool run_naive =
+      prefix_hit_ratios.empty() && nonprefix_hit_ratios.empty();
   for (int32_t prefill_len : prefill_lengths) {
-    for (int32_t generation_len : generation_lengths) {
-      for (int i = 0; i < FLAGS_warmup_iters; ++i) {
-        (void)run_single<T>(prefill_len, generation_len);
+    if (run_naive) {
+      for (int32_t generation_len : generation_lengths) {
+        for (int i = 0; i < FLAGS_warmup_iters; ++i) {
+          const uint64_t seed = next_prompt_seed(FLAGS_prompt_token_seed);
+          const std::vector<uint64_t> prompt_tokens =
+              build_random_prompt_tokens(prefill_len, vocab_size, seed);
+          (void)run_single<T>(prompt_tokens, generation_len, vocab_size);
+        }
+
+        Aggregate aggregate;
+        for (int i = 0; i < FLAGS_num_iters; ++i) {
+          const uint64_t seed = next_prompt_seed(FLAGS_prompt_token_seed);
+          const std::vector<uint64_t> prompt_tokens =
+              build_random_prompt_tokens(prefill_len, vocab_size, seed);
+          aggregate.add(run_single<T>(prompt_tokens, generation_len, vocab_size));
+        }
+        const Sample avg = aggregate.average();
+
+        out << "naive," << prefill_len << "," << 0 << "," << 0 << "," << 0
+            << "," << generation_len << "," << avg.prefill_ms << ","
+            << avg.decode_ms << "," << avg.total_ms << "," << avg.ttft_ms
+            << "," << avg.prefill_tok_per_s << "," << avg.decode_tok_per_s
+            << "\n";
+        out.flush();
+
+        printf(
+            "%12s %10d %12d %10d %10d %14d %14.2f %14.2f %14.2f %18.2f %18.2f %18.2f\n",
+            "naive",
+            prefill_len,
+            0,
+            0,
+            0,
+            generation_len,
+            avg.prefill_ms,
+            avg.decode_ms,
+            avg.total_ms,
+            avg.ttft_ms,
+            avg.prefill_tok_per_s,
+            avg.decode_tok_per_s);
       }
+      continue;
+    }
+    for (int32_t prefix_hit_ratio : prefix_hit_ratios) {
+      const int32_t prefix_len = static_cast<int32_t>(
+          (static_cast<int64_t>(prefill_len) * prefix_hit_ratio) / 100);
+      for (int32_t generation_len : generation_lengths) {
+        for (int i = 0; i < FLAGS_warmup_iters; ++i) {
+          (void)run_single_with_prefix_hit<T>(
+              prefill_len, generation_len, prefix_hit_ratio, vocab_size);
+        }
 
-      Aggregate aggregate;
-      for (int i = 0; i < FLAGS_num_iters; ++i) {
-        aggregate.add(run_single<T>(prefill_len, generation_len));
+        Aggregate aggregate;
+        for (int i = 0; i < FLAGS_num_iters; ++i) {
+          aggregate.add(run_single_with_prefix_hit<T>(
+              prefill_len, generation_len, prefix_hit_ratio, vocab_size));
+        }
+        const Sample avg = aggregate.average();
+
+        out << "prefix," << prefill_len << "," << prefix_len << ","
+            << prefix_len << "," << prefix_hit_ratio
+            << "," << generation_len << "," << avg.prefill_ms << ","
+            << avg.decode_ms << "," << avg.total_ms << "," << avg.ttft_ms
+            << "," << avg.prefill_tok_per_s << "," << avg.decode_tok_per_s
+            << "\n";
+        out.flush();
+
+        printf(
+            "%12s %10d %12d %10d %10d %14d %14.2f %14.2f %14.2f %18.2f %18.2f %18.2f\n",
+            "prefix",
+            prefill_len,
+            prefix_len,
+            prefix_len,
+            prefix_hit_ratio,
+            generation_len,
+            avg.prefill_ms,
+            avg.decode_ms,
+            avg.total_ms,
+            avg.ttft_ms,
+            avg.prefill_tok_per_s,
+            avg.decode_tok_per_s);
       }
-      const Sample avg = aggregate.average();
+    }
+    for (int32_t nonprefix_hit_ratio : nonprefix_hit_ratios) {
+      ET_CHECK_MSG(
+          prefill_len > 128,
+          "--nonprefix_hit_ratios requires prefill_len > 128, got %d",
+          prefill_len);
+      const int32_t prefix_len = 128;
+      const int32_t hit_len = static_cast<int32_t>(
+          (static_cast<int64_t>(prefill_len - 128) * nonprefix_hit_ratio) /
+          100);
+      for (int32_t generation_len : generation_lengths) {
+        for (int i = 0; i < FLAGS_warmup_iters; ++i) {
+          (void)run_single_with_nonprefix_hit<T>(
+              prefill_len, generation_len, nonprefix_hit_ratio, vocab_size);
+        }
 
-      out << prefill_len << "," << generation_len << "," << avg.prefill_ms
-          << "," << avg.decode_ms << "," << avg.total_ms << "," << avg.ttfb_ms
-          << "," << avg.prefill_tok_per_s << "," << avg.decode_tok_per_s << ","
-          << avg.total_tok_per_s << "\n";
-      out.flush();
+        Aggregate aggregate;
+        for (int i = 0; i < FLAGS_num_iters; ++i) {
+          aggregate.add(run_single_with_nonprefix_hit<T>(
+              prefill_len, generation_len, nonprefix_hit_ratio, vocab_size));
+        }
+        const Sample avg = aggregate.average();
 
-      printf(
-          "%10d %14d %14.2f %14.2f %14.2f %14.2f %18.2f %18.2f\n",
-          prefill_len,
-          generation_len,
-          avg.prefill_ms,
-          avg.decode_ms,
-          avg.total_ms,
-          avg.ttfb_ms,
-          avg.prefill_tok_per_s,
-          avg.decode_tok_per_s);
+        out << "nonprefix," << prefill_len << "," << prefix_len << ","
+            << hit_len << "," << nonprefix_hit_ratio << "," << generation_len
+            << "," << avg.prefill_ms << "," << avg.decode_ms << ","
+            << avg.total_ms << "," << avg.ttft_ms << ","
+            << avg.prefill_tok_per_s << "," << avg.decode_tok_per_s << "\n";
+        out.flush();
+
+        printf(
+            "%12s %10d %12d %10d %10d %14d %14.2f %14.2f %14.2f %18.2f %18.2f %18.2f\n",
+            "nonprefix",
+            prefill_len,
+            prefix_len,
+            hit_len,
+            nonprefix_hit_ratio,
+            generation_len,
+            avg.prefill_ms,
+            avg.decode_ms,
+            avg.total_ms,
+            avg.ttft_ms,
+            avg.prefill_tok_per_s,
+            avg.decode_tok_per_s);
+      }
     }
   }
   out.close();
@@ -533,9 +781,13 @@ void run_embed_feature() {
       FLAGS_blend_len,
       static_cast<float>(FLAGS_latency_ratio),
       static_cast<float>(FLAGS_recompute_ratio),
+      FLAGS_enable_nonprefix_lcs,
+      FLAGS_fp16,
+      FLAGS_cpu_kv_pool_mb,
       FLAGS_separate_embed,
       FLAGS_embedding_matrix_path.c_str(),
       FLAGS_rope_config_path.c_str(),
+      nullptr,
       nullptr,
       nullptr,
       std::move(attention_sink_rope_module));
@@ -599,10 +851,16 @@ int main(int argc, char** argv) {
       parse_int_list(FLAGS_prefill_lengths, "prefill_lengths", false);
   const std::vector<int32_t> generation_lengths =
       parse_int_list(FLAGS_generation_lengths, "generation_lengths", true);
+  const std::vector<int32_t> prefix_hit_ratios =
+      parse_optional_percent_list(FLAGS_prefix_hit_ratios, "prefix_hit_ratios");
+  const std::vector<int32_t> nonprefix_hit_ratios =
+      parse_optional_percent_list(
+          FLAGS_nonprefix_hit_ratios, "nonprefix_hit_ratios");
 
   auto module = std::make_unique<executorch::extension::Module>(
       FLAGS_model_path.c_str(),
       executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+  const int32_t vocab_size = infer_vocab_size(module.get());
   example::KvBitWidth kv_bitwidth = example::KvBitWidth::kWidth8;
   if (module->method_names()->count("get_kv_io_bit_width") > 0) {
     kv_bitwidth = static_cast<example::KvBitWidth>(
@@ -625,9 +883,19 @@ int main(int argc, char** argv) {
   }
 
   if (kv_bitwidth == example::KvBitWidth::kWidth8) {
-    run_benchmarks<uint8_t>(prefill_lengths, generation_lengths);
+    run_benchmarks<uint8_t>(
+        prefill_lengths,
+        generation_lengths,
+        prefix_hit_ratios,
+        nonprefix_hit_ratios,
+        vocab_size);
   } else if (kv_bitwidth == example::KvBitWidth::kWidth16) {
-    run_benchmarks<uint16_t>(prefill_lengths, generation_lengths);
+    run_benchmarks<uint16_t>(
+        prefill_lengths,
+        generation_lengths,
+        prefix_hit_ratios,
+        nonprefix_hit_ratios,
+        vocab_size);
   } else {
     ET_CHECK_MSG(
         false,
